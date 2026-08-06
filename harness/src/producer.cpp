@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <string>
 
 #include "message.h"
@@ -68,101 +67,82 @@ Config parse_args(int argc, char** argv) {
   return c;
 }
 
-void set_str(char* dst, uint32_t cap, const char* src) {
-  std::strncpy(dst, src, cap);
-  dst[cap - 1] = '\0';
-}
+// All messages are BTCUSDT@BINANCE for now -- single-instrument placeholder
+// until symbol/venue get a real out-of-band id<->name dictionary.
+constexpr uint32_t kInstrumentId = 1;
 
-void fill_header(msg::Header& h, uint64_t seq, msg::Type type, uint32_t body_len) {
+void fill_header(msg::Header& h, uint64_t seq, msg::Type type,
+                  uint32_t flags_bits) {
   h.seq_id = seq;
-  h.type = static_cast<uint16_t>(type);
-  h.version = 1;
-  h.body_len = body_len;
+  h.instrument_id = kInstrumentId;
+  h.flags_and_type = msg::pack_type(type) | flags_bits;
   h.send_ts_ns = util::now_ns();  // stamp as late as possible before publish
 }
 
 uint32_t build_trade(void* buf, uint64_t seq) {
   auto& m = *reinterpret_cast<msg::Trade*>(buf);
-  set_str(m.symbol, msg::kSymbolLen, "BTCUSDT");
-  set_str(m.venue, msg::kVenueLen, "BINANCE");
-  set_str(m.base_currency, msg::kCurrencyLen, "BTC");
-  set_str(m.quote_currency, msg::kCurrencyLen, "USDT");
   m.trade_id = 100000 + seq;
   m.buyer_order_id = 500000 + seq * 2;
   m.seller_order_id = 500001 + seq * 2;
-  m.exchange_ts_ns = util::now_ns();
-  m.match_engine_ts_ns = m.exchange_ts_ns;
-  m.price = 65000.0 + static_cast<double>(seq % 500) * 0.5;
-  m.quantity = 0.001 + static_cast<double>(seq % 100) * 0.01;
-  m.notional = m.price * m.quantity;
-  m.price_ticks = static_cast<int64_t>(m.price * 100.0);
-  m.quantity_lots = static_cast<int64_t>(m.quantity * 1000.0);
-  m.tick_direction = seq % 4;
-  m.aggressor_side = static_cast<uint8_t>(seq & 1);
-  m.is_block_trade = 0;
-  m.is_rpi = 0;
-  m.is_liquidation = 0;
-  m.flags = 0;
-  std::memset(m.reserved, 0, sizeof(m.reserved));
-  fill_header(m.header, seq, msg::Type::Trade, sizeof(msg::Trade));
+  m.match_engine_ts_ns = util::now_ns();
+  const double price = 65000.0 + static_cast<double>(seq % 500) * 0.5;
+  const double quantity = 0.001 + static_cast<double>(seq % 100) * 0.01;
+  m.price_ticks = static_cast<int64_t>(price * 100.0);
+  m.quantity_lots = static_cast<int64_t>(quantity * 1000.0);
+
+  const uint32_t tick_direction = seq % 4;
+  const uint32_t aggressor_side = seq & 1;
+  const uint32_t flags_bits =
+      (tick_direction << msg::kTradeTickDirectionShift) |
+      (aggressor_side ? msg::kTradeFlagAggressorSide : 0);
+  // is_block_trade / is_rpi / is_liquidation flags exist (kTradeFlag*) but
+  // this synthetic feed never sets them -- left at 0.
+  fill_header(m.header, seq, msg::Type::Trade, flags_bits);
   return sizeof(msg::Trade);
 }
 
 uint32_t build_bbo(void* buf, uint64_t seq) {
   auto& m = *reinterpret_cast<msg::Bbo*>(buf);
-  set_str(m.symbol, msg::kSymbolLen, "BTCUSDT");
-  set_str(m.venue, msg::kVenueLen, "BINANCE");
   m.update_id = 900000 + seq;
-  m.exchange_ts_ns = util::now_ns();
-  m.match_engine_ts_ns = m.exchange_ts_ns;
+  m.match_engine_ts_ns = util::now_ns();
   const double mid = 65000.0 + static_cast<double>(seq % 500) * 0.5;
-  m.bid_price = mid - 0.5;
-  m.ask_price = mid + 0.5;
-  m.bid_size = 1.5 + static_cast<double>(seq % 50) * 0.1;
-  m.ask_size = 1.5 + static_cast<double>((seq + 7) % 50) * 0.1;
-  m.bid_price_ticks = static_cast<int64_t>(m.bid_price * 100.0);
-  m.ask_price_ticks = static_cast<int64_t>(m.ask_price * 100.0);
-  m.bid_size_lots = static_cast<int64_t>(m.bid_size * 1000.0);
-  m.ask_size_lots = static_cast<int64_t>(m.ask_size * 1000.0);
+  const double bid_price = mid - 0.5;
+  const double ask_price = mid + 0.5;
+  const double bid_size = 1.5 + static_cast<double>(seq % 50) * 0.1;
+  const double ask_size = 1.5 + static_cast<double>((seq + 7) % 50) * 0.1;
+  m.bid_price_ticks = static_cast<int64_t>(bid_price * 100.0);
+  m.ask_price_ticks = static_cast<int64_t>(ask_price * 100.0);
+  m.bid_size_lots = static_cast<int64_t>(bid_size * 1000.0);
+  m.ask_size_lots = static_cast<int64_t>(ask_size * 1000.0);
   m.bid_order_count = 3 + static_cast<uint32_t>(seq % 10);
   m.ask_order_count = 3 + static_cast<uint32_t>((seq + 3) % 10);
-  m.flags = 0;
-  std::memset(m.reserved, 0, sizeof(m.reserved));
-  fill_header(m.header, seq, msg::Type::Bbo, sizeof(msg::Bbo));
+  fill_header(m.header, seq, msg::Type::Bbo, /*flags_bits=*/0);
   return sizeof(msg::Bbo);
 }
 
 uint32_t build_book(void* buf, uint64_t seq) {
   auto& m = *reinterpret_cast<msg::OrderBook*>(buf);
-  set_str(m.symbol, msg::kSymbolLen, "BTCUSDT");
-  set_str(m.venue, msg::kVenueLen, "BINANCE");
   m.update_id = 900000 + seq;
   m.prev_update_id = m.update_id - 1;
-  m.exchange_ts_ns = util::now_ns();
-  m.match_engine_ts_ns = m.exchange_ts_ns;
+  m.match_engine_ts_ns = util::now_ns();
   const double mid = 65000.0 + static_cast<double>(seq % 500) * 0.5;
   for (uint32_t i = 0; i < msg::kBookDepth; ++i) {
-    msg::Level& b = m.bids[i];
-    b.price = mid - 0.5 - static_cast<double>(i);
-    b.size = 1.0 + static_cast<double>((seq + i) % 40) * 0.1;
-    b.price_ticks = static_cast<int64_t>(b.price * 100.0);
-    b.size_lots = static_cast<int64_t>(b.size * 1000.0);
-    b.order_count = 2 + static_cast<uint32_t>((seq + i) % 8);
-    b.reserved = 0;
+    const double bid_price = mid - 0.5 - static_cast<double>(i);
+    const double bid_size = 1.0 + static_cast<double>((seq + i) % 40) * 0.1;
+    m.bidsLevels.price_ticks[i] = static_cast<int64_t>(bid_price * 100.0);
+    m.bidsLevels.size_lots[i] = static_cast<int64_t>(bid_size * 1000.0);
+    m.bidsLevels.order_count[i] = 2 + static_cast<uint32_t>((seq + i) % 8);
 
-    msg::Level& a = m.asks[i];
-    a.price = mid + 0.5 + static_cast<double>(i);
-    a.size = 1.0 + static_cast<double>((seq + i + 5) % 40) * 0.1;
-    a.price_ticks = static_cast<int64_t>(a.price * 100.0);
-    a.size_lots = static_cast<int64_t>(a.size * 1000.0);
-    a.order_count = 2 + static_cast<uint32_t>((seq + i + 5) % 8);
-    a.reserved = 0;
+    const double ask_price = mid + 0.5 + static_cast<double>(i);
+    const double ask_size =
+        1.0 + static_cast<double>((seq + i + 5) % 40) * 0.1;
+    m.asksLevels.price_ticks[i] = static_cast<int64_t>(ask_price * 100.0);
+    m.asksLevels.size_lots[i] = static_cast<int64_t>(ask_size * 1000.0);
+    m.asksLevels.order_count[i] =
+        2 + static_cast<uint32_t>((seq + i + 5) % 8);
   }
   m.checksum = static_cast<uint32_t>(seq * 2654435761u);
-  m.is_snapshot = 1;
-  m.flags = 0;
-  std::memset(m.reserved, 0, sizeof(m.reserved));
-  fill_header(m.header, seq, msg::Type::OrderBook, sizeof(msg::OrderBook));
+  fill_header(m.header, seq, msg::Type::OrderBook, msg::kBookFlagSnapshot);
   return sizeof(msg::OrderBook);
 }
 
