@@ -2,10 +2,17 @@
 // message (send->recv latency, sequence id); at report time we sort the
 // collected samples for exact percentiles and derive the drop rate from seq
 // gaps.
+//
+// Samples are kept in memory for the whole run and only written out at the end
+// (write_csv). Writing per message would put file I/O on the very loop we are
+// timing, so the numbers would carry filesystem jitter that has nothing to do
+// with the transport.
 #pragma once
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <string>
 #include <vector>
 
 namespace metrics {
@@ -22,10 +29,22 @@ struct Report {
   uint64_t p01 = 0, p50 = 0, p99 = 0, p999 = 0, p9999 = 0;
 };
 
+struct Sample {
+  uint64_t seq_id;
+  uint64_t latency_ns;
+};
+
 class Accumulator {
  public:
   explicit Accumulator(size_t reserve = 0) {
-    if (reserve) latencies_.reserve(reserve);
+    if (reserve) {
+      // resize+clear rather than reserve: reserve only asks the allocator for
+      // address space, so the first pass through the buffer would take a page
+      // fault every 4 KiB *inside* the measurement loop. resize writes to every
+      // page now; clear keeps the capacity.
+      samples_.resize(reserve);
+      samples_.clear();
+    }
   }
 
   void record(uint64_t seq_id, uint64_t latency_ns) {
@@ -37,7 +56,7 @@ class Accumulator {
       if (seq_id > last_seq_) last_seq_ = seq_id;
     }
     ++received_;
-    latencies_.push_back(latency_ns);
+    samples_.push_back(Sample{seq_id, latency_ns});
     sum_ += static_cast<double>(latency_ns);
   }
 
@@ -52,7 +71,9 @@ class Accumulator {
                                    static_cast<double>(r.expected)
                              : 0.0;
 
-    std::vector<uint64_t> s = latencies_;
+    std::vector<uint64_t> s;
+    s.reserve(samples_.size());
+    for (const Sample& sample : samples_) s.push_back(sample.latency_ns);
     std::sort(s.begin(), s.end());
     r.lat_min = s.front();
     r.lat_max = s.back();
@@ -63,6 +84,19 @@ class Accumulator {
     r.p999 = percentile(s, 0.999);
     r.p9999 = percentile(s, 0.9999);
     return r;
+  }
+
+  // Dump the raw samples as `seq,latency_ns` rows, in arrival order. Call once,
+  // after the measurement loop.
+  bool write_csv(const std::string& path) const {
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return false;
+    std::fprintf(f, "seq,latency_ns\n");
+    for (const Sample& s : samples_) {
+      std::fprintf(f, "%llu,%llu\n", (unsigned long long)s.seq_id,
+                   (unsigned long long)s.latency_ns);
+    }
+    return std::fclose(f) == 0;
   }
 
  private:
@@ -81,7 +115,7 @@ class Accumulator {
   uint64_t first_seq_ = 0;
   uint64_t last_seq_ = 0;
   double sum_ = 0.0;
-  std::vector<uint64_t> latencies_;
+  std::vector<Sample> samples_;
 };
 
 }  // namespace metrics

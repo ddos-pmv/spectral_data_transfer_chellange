@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.15)
 project(harness VERSION 1.0 LANGUAGES CXX)
 
+# An unset CMAKE_BUILD_TYPE builds without optimisation, silently -- and then
+# the benchmark measures the wrong binary.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -42,6 +42,31 @@ static void test_metrics_drops() {
   printf("test_metrics_drops OK\n");
 }
 
+static void test_metrics_csv() {
+  metrics::Accumulator acc(4);
+  acc.record(7, 111);
+  acc.record(8, 222);
+
+  const char* path = "/tmp/harness_metrics_test.csv";
+  assert(acc.write_csv(path));
+
+  FILE* f = std::fopen(path, "r");
+  assert(f != nullptr);
+  char header[32] = {0};
+  uint64_t seq = 0, lat = 0;
+  assert(std::fgets(header, sizeof(header), f) != nullptr);
+  assert(std::strcmp(header, "seq,latency_ns\n") == 0);
+  assert(std::fscanf(f, "%llu,%llu", (unsigned long long*)&seq,
+                     (unsigned long long*)&lat) == 2);
+  assert(seq == 7 && lat == 111);
+  assert(std::fscanf(f, "%llu,%llu", (unsigned long long*)&seq,
+                     (unsigned long long*)&lat) == 2);
+  assert(seq == 8 && lat == 222);
+  std::fclose(f);
+  std::remove(path);
+  printf("test_metrics_csv OK\n");
+}
+
 static void test_ring_roundtrip() {
   const uint32_t slots = 8;
   std::vector<uint8_t> mem(shm::region_size(slots));
@@ -110,6 +135,7 @@ static void test_ring_lapping() {
 int main() {
   test_metrics_basic();
   test_metrics_drops();
+  test_metrics_csv();
   test_ring_roundtrip();
   test_ring_lapping();
   printf("ALL TESTS PASSED\n");

@@ -78,6 +78,12 @@ sleep 0.02
 taskset -c 4 ./bin/consumer --from-edge --csv latencies.csv
 ```
 
+For measurements you intend to compare against each other, use
+`scripts/start_with_taskset.sh` instead: it fixes the sample size, repeats the
+run and reports the run-to-run spread (`--help` explains what else moves the
+numbers). A one-off like the above tells you whether things work, not what the
+latency is.
+
 Example output (single host, cores 2/4 isolated):
 
 ```
@@ -119,9 +125,13 @@ to build percentile plots.
 | `--shm NAME`     | `/fanout_ring` | segment name (must match producer) |
 | `--slots N`      | `1024` | slot count (must match producer) |
 | `--count N`      | `0` | stop after N messages (0 = run until idle) |
+| `--warmup N`     | `0` | consume and discard N messages before recording starts |
 | `--from-edge`    | off | start at the producer's live edge (skip startup catch-up) |
-| `--csv FILE`     | — | write per-message `seq,latency_ns` rows |
+| `--csv FILE`     | — | write per-message `seq,latency_ns` rows (written once, after the run) |
 | `--idle-ms MS`   | `2000` | exit after this long with no new messages |
+
+Exit code 3 means the run was short: fewer than `--count` messages were
+recorded, so the sample is not the one that was asked for.
 
 > Without `--from-edge` a consumer that starts after the producer has a
 > head start will "catch up" through a backlog, inflating the early tail. Use

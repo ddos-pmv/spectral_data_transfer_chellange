@@ -3,8 +3,8 @@
 // the per-message send timestamp and sequence id. Fixed measurement end of the
 // harness.
 //
-// Usage: consumer [--shm NAME] [--slots N] [--count N] [--from-edge]
-//                 [--csv FILE] [--idle-ms MS]
+// Usage: consumer [--shm NAME] [--slots N] [--count N] [--warmup N]
+//                 [--from-edge] [--csv FILE] [--idle-ms MS]
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +23,7 @@ struct Config {
   std::string shm_name = "/fanout_ring";
   uint32_t slots = 1024;
   uint64_t count = 0;
+  uint64_t warmup = 0;
   bool from_edge = false;
   std::string csv;
   uint64_t idle_ms = 2000;
@@ -42,6 +43,7 @@ Config parse_args(int argc, char** argv) {
     if (a == "--shm") c.shm_name = next();
     else if (a == "--slots") c.slots = static_cast<uint32_t>(std::stoul(next()));
     else if (a == "--count") c.count = std::stoull(next());
+    else if (a == "--warmup") c.warmup = std::stoull(next());
     else if (a == "--from-edge") c.from_edge = true;
     else if (a == "--csv") c.csv = next();
     else if (a == "--idle-ms") c.idle_ms = std::stoull(next());
@@ -79,16 +81,13 @@ int main(int argc, char** argv) {
   shm::Ring ring;
   ring.attach(seg.base(), cfg.slots, /*init=*/false);
 
+  // Sized for exactly what the run will record, so no reallocation lands in the
+  // middle of the measurement.
   metrics::Accumulator acc(cfg.count ? cfg.count : 1u << 20);
 
-  FILE* csv = nullptr;
-  if (!cfg.csv.empty()) {
-    csv = std::fopen(cfg.csv.c_str(), "w");
-    if (csv) std::fprintf(csv, "seq,latency_ns\n");
-  }
-
   uint64_t read_index = cfg.from_edge ? ring.live_edge() : 0;
-  uint64_t received = 0;
+  uint64_t consumed = 0;  // frames taken off the ring, warm-up included
+  uint64_t received = 0;  // frames actually recorded
   uint64_t lapped_events = 0;
   const uint64_t idle_ns = cfg.idle_ms * 1000000ull;
   uint64_t last_progress = util::now_ns();
@@ -104,11 +103,14 @@ int main(int argc, char** argv) {
       const auto* hdr = reinterpret_cast<const msg::Header*>(frame);
       const uint64_t latency =
           recv_ts > hdr->send_ts_ns ? recv_ts - hdr->send_ts_ns : 0;
-      acc.record(hdr->seq_id, latency);
-      if (csv) std::fprintf(csv, "%llu,%llu\n",
-                            (unsigned long long)hdr->seq_id,
-                            (unsigned long long)latency);
-      ++received;
+      // The first `warmup` frames are timed and then thrown away: same code
+      // path, so caches, branch predictors and the ring pages are warm by the
+      // time the first recorded sample is taken.
+      if (consumed >= cfg.warmup) {
+        acc.record(hdr->seq_id, latency);
+        ++received;
+      }
+      ++consumed;
       ++read_index;
       last_progress = recv_ts;
     } else if (st == shm::Ring::FrameStatus::kLapped) {
@@ -119,10 +121,16 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (csv) std::fclose(csv);
+  // Written once, off the measurement loop -- see the note in metrics.h.
+  if (!cfg.csv.empty() && !acc.write_csv(cfg.csv)) {
+    fprintf(stderr, "consumer: failed to write %s\n", cfg.csv.c_str());
+    return 1;
+  }
 
   fprintf(stderr, "consumer: lapped %llu times\n",
           (unsigned long long)lapped_events);
   print_report(acc.report());
-  return 0;
+  // A short run means the producer stopped early or the requested sample was
+  // never reached -- the caller must not treat it as a valid measurement.
+  return (cfg.count && received < cfg.count) ? 3 : 0;
 }
