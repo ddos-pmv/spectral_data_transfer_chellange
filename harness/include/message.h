@@ -61,7 +61,7 @@ inline Type unpack_type(uint32_t flags_and_type) {
 // No alignas(64) here: cache-line alignment is the ring Slot's concern, not
 // the wire format's -- padding a message out to 64 bytes just to hit that
 // boundary wastes bytes on every transport that isn't the shm ring itself.
-struct alignas(64) Trade {
+struct Trade {
   Header header;
   uint64_t seller_order_id;
   uint64_t buyer_order_id;
@@ -69,10 +69,10 @@ struct alignas(64) Trade {
   uint64_t match_engine_ts_ns;
   int64_t price_ticks;
   int64_t quantity_lots;
-  uint8_t padding[56];
+  // uint8_t padding[56];
 };
 
-struct alignas(64) Bbo {
+struct Bbo {
   Header header;
   uint64_t update_id;
   uint64_t match_engine_ts_ns;
@@ -82,7 +82,7 @@ struct alignas(64) Bbo {
   int64_t ask_size_lots;
   uint32_t bid_order_count;
   uint32_t ask_order_count;
-  uint8_t padding[48];
+  // uint8_t padding[48];
 };
 
 // Structure-of-arrays book levels: grouping all price_ticks together, then
@@ -97,7 +97,7 @@ struct Levels {
   uint32_t order_count[Depth];
 };
 
-struct alignas(64) OrderBook {
+struct OrderBook {
   Header header;
   uint64_t update_id;
   uint64_t prev_update_id;
@@ -105,7 +105,7 @@ struct alignas(64) OrderBook {
   Levels<kBookDepth> bidsLevels;
   Levels<kBookDepth> asksLevels;
   uint32_t checksum;
-  uint8_t padding[44];
+  // uint8_t padding[44];
 };
 
 inline constexpr uint32_t kMaxFrame = sizeof(OrderBook);
