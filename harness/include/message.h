@@ -108,7 +108,8 @@ struct OrderBook {
   // uint8_t padding[44];
 };
 
-inline constexpr uint32_t kMaxFrame = sizeof(OrderBook);
+inline constexpr uint32_t kMaxFrame =std::max(std::max(sizeof(Bbo) ,sizeof(OrderBook)), sizeof(Trade));
+static_assert(kMaxFrame > 0, "kMaxFrame must be cumputed at compile time");
 static_assert(sizeof(Trade) <= kMaxFrame, "kMaxFrame must fit every message");
 static_assert(sizeof(Bbo) <= kMaxFrame, "kMaxFrame must fit every message");
 

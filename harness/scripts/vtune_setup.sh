@@ -22,4 +22,3 @@ echo "kernel.yama.ptrace_scope=0" >> "$CONFIG_FILE"
 
 echo "Конфигурация сохранена в $CONFIG_FILE"
 echo "===> Готово! Все настройки успешно применены."
-У

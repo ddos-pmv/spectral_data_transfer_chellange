@@ -1,26 +1,44 @@
 cmake_minimum_required(VERSION 3.15)
 project(harness VERSION 1.0 LANGUAGES CXX)
 
-# An unset CMAKE_BUILD_TYPE builds without optimisation, silently -- and then
-# the benchmark measures the wrong binary.
+# Задаем Release по умолчанию, если тип сборки не указан
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Глобальные настройки стандарта C++
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(producer
-        src/producer.cpp
-)
+# Глобальные флаги оптимизации для всех исполняемых файлов
+add_compile_options(-O3)
+add_compile_options(-march=native)
+add_compile_options(-g)
 
+# Глобальные флаги диагностики unrolling в зависимости от компилятора
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Успехи, пропуски и подробный анализ причин для Clang
+    add_compile_options(-Rpass=loop-unroll -Rpass-missed=loop-unroll -Rpass-analysis=loop-unroll)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Абсолютно вся информация по оптимизации циклов для GCC
+    add_compile_options(-fopt-info-loop-all)
+endif()
+
+# --- Определение исполняемых файлов ---
+
+# 1. Producer
+add_executable(producer src/producer.cpp)
 target_include_directories(producer PRIVATE include)
-target_compile_features(producer PRIVATE cxx_std_17)
 
-add_executable(consumer
-        src/consumer.cpp
-)
-
+# 2. Consumer
+add_executable(consumer src/consumer.cpp)
 target_include_directories(consumer PRIVATE include)
-target_compile_features(consumer PRIVATE cxx_std_17)
+
+# 3. Sender
+add_executable(sender src/sender.cpp)
+target_include_directories(sender PRIVATE include)
+
+# 4. Receiver
+add_executable(receiver src/receiver.cpp)
+target_include_directories(receiver PRIVATE include)
