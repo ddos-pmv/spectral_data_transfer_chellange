@@ -154,8 +154,6 @@ int main(int argc, char** argv) {
 
   uint64_t read_index = cfg.from_edge ? ring.live_edge() : 0;
   uint64_t lapped_events = 0, sent_msgs = 0, sent_pkts = 0;
-  const uint64_t idle_ns = cfg.idle_ms * 1000000ull;
-  uint64_t last_progress = util::now_ns();
 
   const uint32_t B = cfg.batch;
   const size_t N = dst_addrs.size();
