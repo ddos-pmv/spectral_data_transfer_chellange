@@ -3,3 +3,4 @@ results/
 scripts/latencies.csv
 scripts/.bench_host_state
 cmake*/
+scripts/__pycache__/
