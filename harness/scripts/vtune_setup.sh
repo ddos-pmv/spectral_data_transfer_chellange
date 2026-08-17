@@ -21,4 +21,22 @@ echo "kernel.kptr_restrict=0" >> "$CONFIG_FILE"
 echo "kernel.yama.ptrace_scope=0" >> "$CONFIG_FILE"
 
 echo "Конфигурация сохранена в $CONFIG_FILE"
+
+echo "===> 3. Проверяем, что применилось..."
+for key in perf_event_paranoid kptr_restrict; do
+  printf '  kernel.%-20s = %s\n' "$key" "$(sysctl -n "kernel.$key")"
+done
+
+# Трейспоинты живут не в perf_event_paranoid, а в правах на tracefs, и без них
+# перестают работать perf sched, off-CPU профилирование и трассировка syscall'ов.
+# bench.py их не использует именно поэтому.
+if [ -r /sys/kernel/tracing/events ]; then
+  echo "  tracefs                        : доступен (perf sched / off-CPU работают)"
+else
+  echo "  tracefs                        : НЕДОСТУПЕН — perf sched, off-CPU и"
+  echo "                                   трассировка syscall'ов работать не будут."
+  echo "                                   Починка: mount -t tracefs none /sys/kernel/tracing"
+  echo "                                   и chmod -R o+rX /sys/kernel/tracing"
+fi
+
 echo "===> Готово! Все настройки успешно применены."
