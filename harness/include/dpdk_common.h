@@ -292,7 +292,7 @@ class SenderPort {
 
   void free_bulk(rte_mbuf**m, uint32_t n) const {rte_pktmbuf_free_bulk(m,n); }
 
-  // Sends the whole batch, retrying until every packet is actually queued.
+  // Sends batch and retry kMaxTsSpins times if not hole batch sent
   inline uint32_t send_with_retry(rte_mbuf** pkts, uint32_t n) const noexcept {
     uint32_t sent = 0, spins = 0;
     while (sent < n && spins <  kMaxTxSpins) {

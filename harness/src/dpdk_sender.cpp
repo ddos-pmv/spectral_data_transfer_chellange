@@ -146,7 +146,10 @@ int main(int argc, char** argv) {
     }
     uint32_t sent_in_burst = sender.send_with_retry(burst, n);
     sent_msgs += sent_in_burst;
-    sender.alloc_bulk(burst, sent_in_burst);
+
+    // alloc sent mbufs
+    if (sent_in_burst != 0 && !sender.alloc_bulk(burst, sent_in_burst)) [[unlikely]] {++alloc_fail; break;}
+
     auto dropped_in_burst = n - sent_in_burst;
     tx_dropped += dropped_in_burst;
   }
