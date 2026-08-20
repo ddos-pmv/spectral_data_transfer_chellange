@@ -104,7 +104,10 @@ void print_tx_offloads(uint64_t capa, uint64_t enabled) {
 }
 
 int main(int argc, char** argv) {
-    int consumed = rte_eal_init(argc, argv);
+    if (rte_eal_init(argc, argv) < 0) {
+        rte_exit(EXIT_FAILURE, "rte_eal_init failed: %s\n",
+                 rte_strerror(rte_errno));
+    }
     uint16_t avail_cnt = rte_eth_dev_count_avail();
     std::fprintf(stdout, "rte_eth_dev_count_avail()=%d\n", avail_cnt);
 
@@ -175,8 +178,17 @@ int main(int argc, char** argv) {
 
     rte_eth_dev_start(port_id);
 
-    struct rte_eth_link link;
-    rte_eth_link_get(port_id, &link);
-
+    struct rte_eth_link link{};
+    int link_ret = rte_eth_link_get(port_id, &link);
+    if (link_ret != 0) {
+        std::fprintf(stderr, "rte_eth_link_get failed: %s\n",
+                     rte_strerror(-link_ret));
+        return 1;
+    }
+    std::fprintf(stdout, "\n  Линк: %s, скорость %u Mbps, %s\n",
+                 link.link_status == RTE_ETH_LINK_UP ? "up" : "down",
+                 link.link_speed,
+                 link.link_duplex == RTE_ETH_LINK_FULL_DUPLEX ? "full-duplex"
+                                                              : "half-duplex");
     return 0;
 }

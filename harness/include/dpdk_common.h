@@ -173,7 +173,7 @@ inline rte_ether_addr read_mac_address(uint16_t port_id) {
 // configure before queue setup, queue setup before start.
 inline BringUp bring_up(const std::string& pool_name, uint32_t nb_mbufs,
                          uint32_t cache_size, uint16_t nb_rxd, uint16_t nb_txd,
-                         bool need_rxq, bool need_txq) {
+                         bool need_rxq [[maybe_unused]], bool need_txq [[maybe_unused]]) {
   BringUp b{};
   b.port_id = find_first_port();
 
@@ -213,11 +213,11 @@ class SenderPort {
              uint32_t cache_size, uint16_t nb_txd,
              const rte_ether_addr& dst_mac, uint32_t src_ip_be,
              uint32_t dst_ip_be, uint16_t src_port, uint16_t dst_port)
-      : dst_mac_(dst_mac),
-        src_ip_be_(src_ip_be),
+      : src_ip_be_(src_ip_be),
         dst_ip_be_(dst_ip_be),
         src_port_(src_port),
-        dst_port_(dst_port) {
+        dst_port_(dst_port),
+        dst_mac_(dst_mac) {
     detail::BringUp b =
         detail::bring_up(pool_name, nb_mbufs, cache_size, /*nb_rxd=*/0,
                           nb_txd, /*need_rxq=*/false, /*need_txq=*/true);

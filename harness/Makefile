@@ -7,9 +7,18 @@ LDLIBS   ?= -lrt -lpthread
 BIN := bin
 BINARIES := $(BIN)/producer $(BIN)/consumer $(BIN)/sender $(BIN)/receiver
 
+# DPDK-транспорт собирается, только если в системе есть libdpdk: на машине без
+# него `make` должен по-прежнему давать рабочий UDP-baseline, а не падать.
+# pkg-config сам отдаёт нужный -march=native и -include rte_config.h.
+DPDK_CFLAGS := $(shell pkg-config --cflags libdpdk 2>/dev/null)
+DPDK_LIBS   := $(shell pkg-config --libs libdpdk 2>/dev/null)
+ifneq ($(DPDK_LIBS),)
+DPDK_BINARIES := $(BIN)/dpdk_sender $(BIN)/dpdk_reciever $(BIN)/dpdk_probe
+endif
+
 .PHONY: all clean test
 
-all: $(BINARIES)
+all: $(BINARIES) $(DPDK_BINARIES)
 
 $(BIN):
 	mkdir -p $(BIN)
@@ -25,6 +34,11 @@ $(BIN)/producer: src/producer.cpp include/*.h | $(BIN)
 
 $(BIN)/consumer: src/consumer.cpp include/*.h | $(BIN)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
+
+# Динамическая линковка намеренно: драйверы (net_af_xdp, net_ena) живут
+# отдельными .so и подгружаются EAL'ом в рантайме, в бинарь не попадают.
+$(BIN)/dpdk_%: src/dpdk_%.cpp include/*.h | $(BIN)
+	$(CXX) $(CXXFLAGS) $(DPDK_CFLAGS) $< -o $@ $(DPDK_LIBS) $(LDLIBS)
 
 test: $(BIN)/test_harness
 	./$(BIN)/test_harness

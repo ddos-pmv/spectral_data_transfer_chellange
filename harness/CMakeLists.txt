@@ -15,6 +15,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-O3)
 add_compile_options(-march=native)
 add_compile_options(-g)
+add_compile_options(-Wall -Wextra)
 
 # Глобальные флаги диагностики unrolling в зависимости от компилятора
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
