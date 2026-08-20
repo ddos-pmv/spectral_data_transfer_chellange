@@ -1,0 +1,86 @@
+# Конфиг прогона DPDK-цепочки для dpdk.py.
+#
+# СТЕНД ПОДНИМАЕТСЯ ОДИН РАЗ, ВРУЧНУЮ. Скрипт его только проверяет — состояние
+# стенда должно быть зафиксировано в описании решения, а не пересоздаваться
+# неявно на каждом прогоне. Команды (переживают до перезагрузки):
+#
+#   sudo ip link add veth-tx address 02:00:00:00:00:01 type veth \
+#                peer name veth-rx address 02:00:00:00:00:02
+#   sudo ip link set veth-tx up && sudo ip link set veth-rx up
+#   # фальшивые контрольные суммы и GRO/GSO мешают сырому AF_XDP-пути:
+#   for i in veth-tx veth-rx; do
+#     sudo ethtool -K $i tx off rx off gro off gso off tso off
+#     sudo ethtool -L $i combined 1   # XDP-сокет привязан к очереди 0
+#   done
+#   sudo sh -c 'echo 2048 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'
+#
+# [[proc]] — список процессов В ПОРЯДКЕ ЗАПУСКА. Скрипт не знает, что такое
+# producer или sender: он просто рендерит args в флаги командной строки.
+# Добавить бинарю новый флаг = дописать строку сюда, скрипт не трогать.
+#
+# Правила рендеринга args/eal:
+#   key = "value"  ->  --key value
+#   key = true     ->  --key          (флаг без значения)
+#   key = false    ->  (пропускается)
+#   однобуквенный ключ -> -k value    (для EAL: l, n, m)
+#
+# Прогон заканчивается, когда завершается ПОСЛЕДНИЙ процесс в списке
+# (consumer выходит сам, набрав count замеров). Остальных гасят SIGTERM'ом
+# в обратном порядке, чтобы каждый успел напечатать свою статистику.
+
+[bench]
+repeats = 3     # один p99.9 — это выборка, а не число
+
+[[proc]]
+name = "producer"
+cpu = 8
+wait_shm = "/dev/shm/fanout_ring"   # ждать появления, прежде чем пускать следующего
+[proc.args]
+shm = "/fanout_ring"
+slots = 1024
+count = 0            # 0 = без ограничения, остановим сигналом
+rate = 200_000       # msg/s, 0 = без троттлинга
+type = "mixed"       # trade | bbo | book | mixed
+
+
+[[proc]]
+name = "dpdk_reciever"
+cpu = 2
+wait_shm = "/dev/shm/fanout_ring_rx"
+[proc.eal]
+l = 2
+file-prefix = "rx"
+vdev = "net_af_xdp0,iface=veth-rx,start_queue=0,queue_count=1"
+[proc.args]
+shm = "/fanout_ring_rx"
+slots = 1024
+port = 40001
+burst = 32
+
+
+[[proc]]
+name = "dpdk_sender"
+cpu = 4
+[proc.eal]
+l = 4
+file-prefix = "tx"
+vdev = "net_af_xdp0,iface=veth-tx,start_queue=0,queue_count=1"
+[proc.args]
+shm = "/fanout_ring"
+slots = 1024
+dst-mac = "02:00:00:00:00:02"
+src-ip = "10.0.0.1"
+dst-ip = "10.0.0.2"
+dst-port = 40001
+burst = 32
+
+
+[[proc]]
+name = "consumer"
+cpu = 6
+[proc.args]
+shm = "/fanout_ring_rx"
+slots = 1024
+from-edge = true
+count = 2_000_000    # записанных замеров; после них consumer выходит сам
+warmup = 20_000      # съедается и выбрасывается до начала записи
