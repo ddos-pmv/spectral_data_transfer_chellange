@@ -42,3 +42,27 @@ target_include_directories(sender PRIVATE include)
 # 4. Receiver
 add_executable(receiver src/receiver.cpp)
 target_include_directories(receiver PRIVATE include)
+
+
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DPDK IMPORTED_TARGET libdpdk)
+
+if (DPDK_FOUND)
+    message(STATUS "DPDK ${DPDK_VERSION} found, building DPDK transport")
+
+    add_executable(dpdk_probe src/dpdk_probe.cpp)
+    target_include_directories(dpdk_probe PRIVATE include)
+    target_link_libraries(dpdk_probe PRIVATE PkgConfig::DPDK)
+
+
+    add_executable(dpdk_sender src/dpdk_sender.cpp)
+    target_include_directories(dpdk_sender PRIVATE include)
+    target_link_libraries(dpdk_sender PRIVATE PkgConfig::DPDK)
+
+    add_executable(dpdk_reciever src/dpdk_reciever.cpp)
+    target_include_directories(dpdk_reciever PRIVATE include)
+    target_link_libraries(dpdk_reciever PRIVATE PkgConfig::DPDK)
+else()
+    message(STATUS "DPDK not found, skipping DPDK transport targets")
+endif()

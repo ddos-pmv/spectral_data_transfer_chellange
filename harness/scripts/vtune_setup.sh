@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Проверяем, что скрипт запущен с правами root
 if [ "$EUID" -ne 0 ]; then
