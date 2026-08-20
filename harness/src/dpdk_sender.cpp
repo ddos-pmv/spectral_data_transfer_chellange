@@ -75,7 +75,7 @@ Config parse_args(int argc, char** argv) {
     std::fprintf(stderr, "--dst-mac is required (peer's NIC MAC address)\n");
     std::exit(2);
   }
-  if (c.burst > 64) c.burst = 64;
+  if (c.burst > 128) c.burst = 128;
   return c;
 }
 
@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
   if (!dpdk::parse_ipv4(cfg.src_ip_str, &src_ip_be) ||
       !dpdk::parse_ipv4(cfg.dst_ip_str, &dst_ip_be)) {
     rte_exit(EXIT_FAILURE, "bad --src-ip/--dst-ip\n");
-  }
+      }
 
   dpdk::SenderPort sender("sender_pool", cfg.nb_mbufs, cfg.cache_size,
                            /*nb_txd=*/1024, dst_mac, src_ip_be, dst_ip_be,
@@ -113,23 +113,21 @@ int main(int argc, char** argv) {
   ring.attach(seg.base(), cfg.slots, /*init=*/false);
 
   uint64_t read_index = ring.live_edge();
-  uint64_t sent_msgs = 0, lapped = 0, alloc_fail = 0, tx_dropped = 0;
+  uint64_t sent_msgs = 0, lapped = 0, alloc_fail = 0, tx_dropped = 0, empty_spins = 0;
 
-  rte_mbuf* burst[64];
+  rte_mbuf* burst[128];
 
   std::fprintf(stderr, "dpdk_sender: shm=%s -> %s:%u dst_mac=%s\n",
                cfg.shm_name.c_str(), cfg.dst_ip_str.c_str(), cfg.dst_port,
                cfg.dst_mac_str.c_str());
 
+  if (!sender.alloc_bulk(burst, cfg.burst)) {
+    std::fprintf(stderr, "cannot alloc bulk");
+    rte_exit(EXIT_FAILURE, "cannot alloc bulk");
+  }
+
   while (!g_stop && (cfg.count == 0 || sent_msgs < cfg.count)) {
     uint32_t n = 0;
-    if (!sender.alloc_bulk(burst, cfg.burst)) [[unlikely]] {
-      // Never print from the hot path: stderr is unbuffered, so every
-      // fprintf here would be a write() syscall in a tight spin loop.
-      ++alloc_fail;
-      continue;
-    }
-
     while (n < cfg.burst) {
       uint32_t len = 0;
       uint64_t resume = 0;
@@ -142,14 +140,14 @@ int main(int argc, char** argv) {
         ++lapped;
         read_index = resume;
       } else [[unlikely]] {
+        ++empty_spins;
         break;  // kEmpty: nothing new right now
       }
     }
-    uint32_t sent_in_burst = sender.send_all(burst, n);
+    uint32_t sent_in_burst = sender.send_with_retry(burst, n);
     sent_msgs += sent_in_burst;
-
+    sender.alloc_bulk(burst, sent_in_burst);
     auto dropped_in_burst = n - sent_in_burst;
-    if ( n < cfg.burst) sender.free_bulk(&burst[sent_in_burst], cfg.burst - sent_in_burst);
     tx_dropped += dropped_in_burst;
   }
 
@@ -158,10 +156,12 @@ int main(int argc, char** argv) {
                "sent       : %llu\n"
                "lapped     : %llu\t(producer overwrote us; frames skipped)\n"
                "tx_dropped : %llu\t(our own loss: tx ring stayed full)\n"
-               "alloc_fail : %llu\t(mbuf pool empty)\n",
+               "alloc_fail : %llu\t(mbuf pool empty)\n"
+               "empty_spins: %llu\t(read from ring return none)\n",
                static_cast<unsigned long long>(sent_msgs),
                static_cast<unsigned long long>(lapped),
                static_cast<unsigned long long>(tx_dropped),
-               static_cast<unsigned long long>(alloc_fail));
+               static_cast<unsigned long long>(alloc_fail),
+               static_cast<unsigned long long>(empty_spins));
   return 0;
 }

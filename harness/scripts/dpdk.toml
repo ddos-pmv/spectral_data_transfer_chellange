@@ -39,7 +39,7 @@ wait_shm = "/dev/shm/fanout_ring"   # ждать появления, прежд�
 shm = "/fanout_ring"
 slots = 1024
 count = 0            # 0 = без ограничения, остановим сигналом
-rate = 200_000       # msg/s, 0 = без троттлинга
+rate = 300_000       # msg/s, 0 = без троттлинга
 type = "mixed"       # trade | bbo | book | mixed
 
 

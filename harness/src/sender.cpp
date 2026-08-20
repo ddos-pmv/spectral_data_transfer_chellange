@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
   ring.attach(seg.base(), cfg.slots, /*init=*/false);
 
   uint64_t read_index = cfg.from_edge ? ring.live_edge() : 0;
-  uint64_t lapped_events = 0, sent_msgs = 0, sent_pkts = 0;
+  uint64_t lapped_events = 0, sent_msgs = 0, sent_pkts = 0, empty_spins = 0;
 
   const uint32_t B = cfg.batch;
   const size_t N = dst_addrs.size();
@@ -182,6 +182,7 @@ int main(int argc, char** argv) {
         ++lapped_events;
         read_index = resume;
       } else {
+        empty_spins++;
         break;  // kEmpty: nothing more ready right now, flush what we have
       }
     }
@@ -218,8 +219,8 @@ int main(int argc, char** argv) {
   }
 
   fprintf(stderr,
-          "sender: sent %llu messages (%llu packets) to %zu dst(s), lapped %llu\n",
-          (unsigned long long)sent_msgs, (unsigned long long)sent_pkts, N,
+          "sender: sent %llu messages (%llu packets) to %zu dst(s), empty_spins:%llu, lapped %llu\n",
+          (unsigned long long)sent_msgs, (unsigned long long)sent_pkts, N, (unsigned long long)empty_spins,
           (unsigned long long)lapped_events);
   close(sock);
   return 0;

@@ -30,8 +30,8 @@
 
 namespace dpdk {
 
-inline constexpr uint32_t kMaxTxSpins = 255;
-inline constexpr uint32_t kMaxRxSpins = 255;
+inline constexpr uint32_t kMaxTxSpins = 10;
+inline constexpr uint32_t kMaxRxSpins = 10;
 
 // "AA:BB:CC:DD:EE:FF" -> rte_ether_addr. Hand-parsed, no dependency on
 // rte_ether_unformat_addr (not present in every DPDK version).
@@ -293,7 +293,7 @@ class SenderPort {
   void free_bulk(rte_mbuf**m, uint32_t n) const {rte_pktmbuf_free_bulk(m,n); }
 
   // Sends the whole batch, retrying until every packet is actually queued.
-  uint32_t send_all(rte_mbuf** pkts, uint32_t n) {
+  inline uint32_t send_with_retry(rte_mbuf** pkts, uint32_t n) const noexcept {
     uint32_t sent = 0, spins = 0;
     while (sent < n && spins <  kMaxTxSpins) {
       uint16_t k = rte_eth_tx_burst(port_id_, 0, pkts + sent, n - sent);
