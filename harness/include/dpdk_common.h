@@ -421,7 +421,7 @@ class ReceiverPort {
   ReceiverPort(const ReceiverPort&) = delete;
   ReceiverPort& operator=(const ReceiverPort&) = delete;
 
-  uint16_t receive(rte_mbuf** pkts, uint16_t max_pkts) const {
+  inline uint16_t receive(rte_mbuf** pkts, uint16_t max_pkts) const {
     return rte_eth_rx_burst(port_id_, 0, pkts, max_pkts);
   }
 

@@ -80,57 +80,13 @@ RingHandle create_output_ring(const std::string& name, uint32_t slots) {
 
 struct Stats {
   uint64_t received = 0;
+  uint64_t bursts = 0;
+  uint64_t burst_pkts = 0;
   uint64_t non_udp = 0;
   uint64_t wrong_port = 0;
   uint64_t bad_len = 0;  // right port, but the length field is not usable
+  uint64_t empty_spins = 0;
 };
-
-// Parses one received mbuf; on a match, republishes its payload into the
-// ring. Always frees the mbuf -- the ring copies what it needs before this
-// returns, so freeing right after is safe either way.
-void handle_packet(rte_mbuf* m, uint16_t want_port_be, shm::Ring& ring,
-                    Stats& stats) {
-  const uint8_t* payload = nullptr;
-  uint16_t payload_len = 0;
-
-  auto status = dpdk::ReceiverPort::extract_udp_payload(m, want_port_be,
-                                                          &payload,
-                                                          &payload_len);
-
-  if (status == dpdk::ReceiverPort::ParseStatus::kOk) {
-    if (payload_len > 0 && payload_len <= shm::kFrameCap) {
-      ring.publish(payload, payload_len);  // the one copy on this side
-      ++stats.received;
-    } else {
-      ++stats.bad_len;
-    }
-  } else if (status == dpdk::ReceiverPort::ParseStatus::kWrongPort) {
-    ++stats.wrong_port;
-  } else {
-    ++stats.non_udp;
-  }
-  rte_pktmbuf_free(m);
-}
-
-// Busy-spins until SIGINT/SIGTERM: pull a burst, handle each packet, repeat.
-Stats run_receiver_loop(dpdk::ReceiverPort& receiver, shm::Ring& ring,
-                         uint16_t udp_port, uint16_t burst_size) {
-  const uint16_t want_port_be = rte_cpu_to_be_16(udp_port);
-  Stats stats;
-  rte_mbuf* burst[64];
-
-  while (!g_stop) {
-    uint16_t n = receiver.receive(burst, burst_size);
-    if (n == 0) {
-      rte_pause();
-      continue;
-    }
-    for (uint16_t i = 0; i < n; ++i) {
-      handle_packet(burst[i], want_port_be, ring, stats);
-    }
-  }
-  return stats;
-}
 
 }  // namespace
 
@@ -153,18 +109,62 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "dpdk_receiver: listening udp/%u -> shm=%s\n",
                cfg.udp_port, cfg.shm_name.c_str());
 
-  const Stats stats =
-      run_receiver_loop(receiver, out.ring, cfg.udp_port, cfg.burst);
+  const uint16_t want_port_be = rte_cpu_to_be_16(cfg.udp_port);
+  Stats stats;
+  rte_mbuf* burst[64];
+
+  while (!g_stop) {
+    uint16_t n = receiver.receive(burst, cfg.burst);
+    ++stats.bursts;
+    stats.burst_pkts++;
+    if (n==0) [[unlikely]] {
+      ++stats.empty_spins;
+      continue;
+    }
+
+    rte_prefetch0(rte_pktmbuf_mtod(burst[0], void*));
+    for (uint16_t i = 0; i < n; ++i) {
+      const uint8_t* payload = nullptr;
+      uint16_t payload_len = 0;
+
+      if (i + 1 < n) {
+        rte_prefetch0(rte_pktmbuf_mtod(burst[i + 1], void*));
+        rte_prefetch0(rte_pktmbuf_mtod_offset(burst[i+1], void*, 128));
+      }
+
+      auto status = dpdk::ReceiverPort::extract_udp_payload(burst[i], want_port_be,
+                                                              &payload,
+                                                              &payload_len);
+
+      if (status == dpdk::ReceiverPort::ParseStatus::kOk) {
+        if (payload_len > 0 && payload_len <= shm::kFrameCap) {
+          out.ring.publish(payload, payload_len);  // the one copy on this side
+          ++stats.received;
+        } else {
+          ++stats.bad_len;
+        }
+      } else if (status == dpdk::ReceiverPort::ParseStatus::kWrongPort) {
+        ++stats.wrong_port;
+      } else {
+        ++stats.non_udp;
+      }
+    }
+    rte_pktmbuf_free_bulk(burst, n);
+  }
 
   std::fprintf(stderr,
                "\n---- dpdk_receiver ----\n"
-               "received   : %llu\t(published into the ring)\n"
-               "wrong_port : %llu\t(udp, but not our port)\n"
-               "non_udp    : %llu\t(not ipv4/udp at all)\n"
-               "bad_len    : %llu\t(our port, unusable length)\n",
+               "received    : %llu\t(published into the ring)\n"
+               "wrong_port  : %llu\t(udp, but not our port)\n"
+               "non_udp     : %llu\t(not ipv4/udp at all)\n"
+               "bad_len     : %llu\t(our port, unusable length)\n"
+               "empty_spins : %llu\t(receiver.receive(burst, cfg.burst) returned zero)\n"
+               "avg_burst : %.2f\t(avg packets in burst)\n",
                static_cast<unsigned long long>(stats.received),
                static_cast<unsigned long long>(stats.wrong_port),
                static_cast<unsigned long long>(stats.non_udp),
-               static_cast<unsigned long long>(stats.bad_len));
+               static_cast<unsigned long long>(stats.bad_len),
+               static_cast<unsigned long long>(stats.empty_spins),
+               static_cast<double>(stats.burst_pkts)/static_cast<double>(stats.bursts));
   return 0;
 }

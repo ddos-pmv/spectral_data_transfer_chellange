@@ -75,7 +75,7 @@ Config parse_args(int argc, char** argv) {
     std::fprintf(stderr, "--dst-mac is required (peer's NIC MAC address)\n");
     std::exit(2);
   }
-  if (c.burst > 128) c.burst = 128;
+  if (c.burst > 1024) c.burst = 1024;
   return c;
 }
 
@@ -113,9 +113,9 @@ int main(int argc, char** argv) {
   ring.attach(seg.base(), cfg.slots, /*init=*/false);
 
   uint64_t read_index = ring.live_edge();
-  uint64_t sent_msgs = 0, lapped = 0, alloc_fail = 0, tx_dropped = 0, empty_spins = 0;
+  uint64_t sent_msgs = 0, lapped = 0, alloc_fail = 0, tx_dropped = 0, empty_spins = 0, bursts = 0, burst_pkts = 0;
 
-  rte_mbuf* burst[128];
+  rte_mbuf* burst[1024];
 
   std::fprintf(stderr, "dpdk_sender: shm=%s -> %s:%u dst_mac=%s\n",
                cfg.shm_name.c_str(), cfg.dst_ip_str.c_str(), cfg.dst_port,
@@ -126,11 +126,17 @@ int main(int argc, char** argv) {
     rte_exit(EXIT_FAILURE, "cannot alloc bulk");
   }
 
+  rte_prefetch0_write(rte_pktmbuf_mtod(burst[0], void*));
   while (!g_stop && (cfg.count == 0 || sent_msgs < cfg.count)) {
     uint32_t n = 0;
     while (n < cfg.burst) {
       uint32_t len = 0;
       uint64_t resume = 0;
+
+      if (n + 1 < cfg.burst) {
+        rte_prefetch0_write(rte_pktmbuf_mtod(burst[n+1], void*));
+        rte_prefetch0_write(rte_pktmbuf_mtod_offset(burst[n+1], void*, 128));
+      }
       // Ring copies the frame straight into mbuf memory -- no scratch buffer.
       auto st = ring.read(read_index, sender.payload_ptr(burst[n]), &len, &resume);
       if (st == shm::Ring::FrameStatus::kOk) [[likely]] {
@@ -144,6 +150,8 @@ int main(int argc, char** argv) {
         break;  // kEmpty: nothing new right now
       }
     }
+    ++bursts;
+    burst_pkts += n;
     uint32_t sent_in_burst = sender.send_with_retry(burst, n);
     sent_msgs += sent_in_burst;
 
@@ -160,11 +168,13 @@ int main(int argc, char** argv) {
                "lapped     : %llu\t(producer overwrote us; frames skipped)\n"
                "tx_dropped : %llu\t(our own loss: tx ring stayed full)\n"
                "alloc_fail : %llu\t(mbuf pool empty)\n"
-               "empty_spins: %llu\t(read from ring return none)\n",
+               "empty_spins: %llu\t(read from ring return none)\n"
+               "avg_burst : %.2f\t(avg packets in burst)\n",
                static_cast<unsigned long long>(sent_msgs),
                static_cast<unsigned long long>(lapped),
                static_cast<unsigned long long>(tx_dropped),
                static_cast<unsigned long long>(alloc_fail),
-               static_cast<unsigned long long>(empty_spins));
+               static_cast<unsigned long long>(empty_spins),
+               static_cast<double>(burst_pkts)/static_cast<double>(bursts));
   return 0;
 }
