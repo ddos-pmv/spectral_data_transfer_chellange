@@ -61,7 +61,7 @@ grep -E 'HugePages_(Total|Free)' /proc/meminfo
 if [ "$WITH_IGB_UIO" = 1 ]; then
   step "igb_uio с Write Combining (нужен для LLQ на ENA)"
   cd "$SRC"
-  [ -d dpdk-kmods ] || git clone --quiet https://github.com/DPDK/dpdk-kmods.git
+  [ -d dpdk-kmods ] || git clone --quiet git://dpdk.org/dpdk-kmods
   cd dpdk-kmods/linux/igb_uio && make >/dev/null
   install -D -m 644 igb_uio.ko "/lib/modules/$(uname -r)/extra/igb_uio.ko"
   depmod -a
