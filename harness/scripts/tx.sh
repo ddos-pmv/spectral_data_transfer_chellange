@@ -9,6 +9,10 @@
 set -euo pipefail
 
 IFACE=${IFACE:-ens5}                    # интерфейс, через который уходит трафик
+# Устройство для EAL. По умолчанию AF_XDP поверх живого интерфейса (ядро видит
+# карту, SSH не теряется). Для ENA PMD передайте адрес PCI, привязанный к
+# vfio-pci:  EAL_DEV="-a 0000:00:06.0,llq_policy=3"  — см. AWS.md.
+EAL_DEV=${EAL_DEV:-"--vdev net_af_xdp0,iface=$IFACE,start_queue=0,queue_count=1"}
 PEER_MAC=${PEER_MAC:?укажите MAC приёмной машины (ip link show <iface> на ней)}
 DST_IP=${DST_IP:?укажите приватный IP приёмной машины}
 SRC_IP=${SRC_IP:-}                      # пусто = взять с IFACE
@@ -55,7 +59,7 @@ for _ in $(seq 50); do [ -e /dev/shm/fanout_ring ] && break; sleep 0.1; done
 
 taskset -c "$CPU_SENDER" setarch -R ./bin/dpdk_sender \
   -l "$CPU_SENDER" --file-prefix tx \
-  --vdev "net_af_xdp0,iface=$IFACE,start_queue=0,queue_count=1" \
+  $EAL_DEV \
   -- --shm /fanout_ring --slots "$SLOTS" \
      --dst-mac "$PEER_MAC" --src-ip "$SRC_IP" --dst-ip "$DST_IP" \
      --dst-port "$DST_PORT" --burst "$BURST" 2>&1 | tee "$RUN/sender.log"

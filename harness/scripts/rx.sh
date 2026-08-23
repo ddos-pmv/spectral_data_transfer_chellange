@@ -9,6 +9,10 @@
 set -euo pipefail
 
 IFACE=${IFACE:-ens5}                    # интерфейс, на который приходит трафик
+# Устройство для EAL. По умолчанию AF_XDP поверх живого интерфейса (ядро видит
+# карту, SSH не теряется). Для ENA PMD передайте адрес PCI, привязанный к
+# vfio-pci:  EAL_DEV="-a 0000:00:06.0,llq_policy=3"  — см. AWS.md.
+EAL_DEV=${EAL_DEV:-"--vdev net_af_xdp0,iface=$IFACE,start_queue=0,queue_count=1"}
 PORT=${PORT:-40001}
 COUNT=${COUNT:-1000000}                 # замеров, после них consumer выходит
 WARMUP=${WARMUP:-20000}                 # съедается и выбрасывается до записи
@@ -21,9 +25,13 @@ cd "$(dirname "$0")/.."
 [ "$(id -u)" = 0 ] || { echo "нужен root: hugepages и AF_XDP требуют привилегий"; exit 1; }
 [ -x bin/dpdk_reciever ] || { echo "нет bin/dpdk_reciever — соберите: make -j\$(nproc)"; exit 1; }
 
-echo "приёмная машина: MAC и IP для tx.sh --"
-ip -o link show "$IFACE" | awk '{print "    PEER_MAC="$(NF-2)}'
-ip -4 -o addr show "$IFACE" | awk '{split($4,a,"/"); print "    DST_IP="a[1]}'
+# В режиме ENA PMD интерфейс уже отвязан от ядра и здесь ничего не найдётся —
+# тогда MAC и IP брать из IMDS, см. AWS.md.
+if [ -e "/sys/class/net/$IFACE" ]; then
+  echo "приёмная машина: подставить в tx.sh --"
+  ip -o link show "$IFACE" | awk '{print "    PEER_MAC="$(NF-2)}'
+  ip -4 -o addr show "$IFACE" | awk '{split($4,a,"/"); print "    DST_IP="a[1]}'
+fi
 
 RUN=results/rx-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$RUN"
@@ -47,7 +55,7 @@ echo "    логи: $RUN"
 
 taskset -c "$CPU_RECEIVER" setarch -R ./bin/dpdk_reciever \
   -l "$CPU_RECEIVER" --file-prefix rx \
-  --vdev "net_af_xdp0,iface=$IFACE,start_queue=0,queue_count=1" \
+  $EAL_DEV \
   -- --shm /fanout_ring_rx --slots "$SLOTS" --port "$PORT" --burst "$BURST" \
   > "$RUN/receiver.log" 2>&1 &
 RECEIVER=$!

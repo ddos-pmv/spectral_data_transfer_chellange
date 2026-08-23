@@ -39,7 +39,7 @@ wait_shm = "/dev/shm/fanout_ring"   # ждать появления, прежд�
 shm = "/fanout_ring"
 slots = 1024
 count = 0            # 0 = без ограничения, остановим сигналом
-rate = 300_000       # msg/s, 0 = без троттлинга
+rate = 0       # msg/s, 0 = без троттлинга
 type = "mixed"       # trade | bbo | book | mixed
 
 
@@ -55,7 +55,7 @@ vdev = "net_af_xdp0,iface=veth-rx,start_queue=0,queue_count=1"
 shm = "/fanout_ring_rx"
 slots = 1024
 port = 40001
-burst = 32
+burst = 128
 
 
 [[proc]]
@@ -64,7 +64,7 @@ cpu = 4
 [proc.eal]
 l = 4
 file-prefix = "tx"
-vdev = "net_af_xdp0,iface=veth-tx,start_queue=0,queue_count=1"
+vdev = "net_null0,no-rx=1"
 [proc.args]
 shm = "/fanout_ring"
 slots = 1024
@@ -72,7 +72,7 @@ dst-mac = "02:00:00:00:00:02"
 src-ip = "10.0.0.1"
 dst-ip = "10.0.0.2"
 dst-port = 40001
-burst = 32
+burst = 256
 
 
 [[proc]]
@@ -82,5 +82,4 @@ cpu = 6
 shm = "/fanout_ring_rx"
 slots = 1024
 from-edge = true
-count = 2_000_000    # записанных замеров; после них consumer выходит сам
-warmup = 20_000      # съедается и выбрасывается до начала записи
+count = 3_000_000    # записанных замеров; после них consumer выходит сам
