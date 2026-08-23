@@ -11,8 +11,9 @@ set -euo pipefail
 IFACE=${IFACE:-ens5}                    # интерфейс, через который уходит трафик
 # Устройство для EAL. По умолчанию AF_XDP поверх живого интерфейса (ядро видит
 # карту, SSH не теряется). Для ENA PMD передайте адрес PCI, привязанный к
-# vfio-pci:  EAL_DEV="-a 0000:00:06.0,llq_policy=3"  — см. AWS.md.
+# igb_uio:  EAL_DEV="-a 0000:28:00.0"  — см. AWS.md, раздел 8.
 EAL_DEV=${EAL_DEV:-"--vdev net_af_xdp0,iface=$IFACE,start_queue=0,queue_count=1"}
+ENI_INDEX=${ENI_INDEX:-1}               # device-index ENI, отданной DPDK (режим А)
 PEER_MAC=${PEER_MAC:?укажите MAC приёмной машины (ip link show <iface> на ней)}
 DST_IP=${DST_IP:?укажите приватный IP приёмной машины}
 SRC_IP=${SRC_IP:-}                      # пусто = взять с IFACE
@@ -25,12 +26,21 @@ CPU_PRODUCER=${CPU_PRODUCER:-0}
 CPU_SENDER=${CPU_SENDER:-1}
 
 cd "$(dirname "$0")/.."
+. scripts/dpdk-eni.sh
 [ "$(id -u)" = 0 ] || { echo "нужен root: hugepages и AF_XDP требуют привилегий"; exit 1; }
 [ -x bin/dpdk_sender ] || { echo "нет bin/dpdk_sender — соберите: make -j\$(nproc)"; exit 1; }
 
-# VPC режет пакеты, у которых src IP не совпадает с адресом ENI.
-[ -n "$SRC_IP" ] || SRC_IP=$(ip -4 -o addr show "$IFACE" | awk '{print $4}' | cut -d/ -f1)
-[ -n "$SRC_IP" ] || { echo "у $IFACE нет IPv4-адреса"; exit 1; }
+# VPC режет пакеты, у которых src IP не совпадает с адресом ENI, поэтому адрес
+# берём с той самой карты, через которую уходит трафик, а не с любой соседней.
+if [ -z "$SRC_IP" ]; then
+  if kernel_mode; then
+    SRC_IP=$(ip -4 -o addr show "$IFACE" | awk '{print $4}' | cut -d/ -f1)
+  else
+    ADDRS=$(eni_addrs "$ENI_INDEX") || ADDRS=""
+    [ -n "$ADDRS" ] && read -r _ SRC_IP <<<"$ADDRS"
+  fi
+fi
+[ -n "$SRC_IP" ] || { echo "не удалось определить src IP — задайте SRC_IP=..."; exit 1; }
 
 RUN=results/tx-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$RUN"
@@ -45,7 +55,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "tx: $SRC_IP -> $DST_IP:$DST_PORT ($PEER_MAC) через $IFACE, rate=$RATE"
+echo "tx: $SRC_IP -> $DST_IP:$DST_PORT ($PEER_MAC), rate=$RATE ($EAL_DEV)"
 echo "    логи: $RUN"
 
 taskset -c "$CPU_PRODUCER" setarch -R ./bin/producer \

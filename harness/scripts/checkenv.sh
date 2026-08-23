@@ -156,19 +156,39 @@ if [ ! -e "/sys/class/net/$IFACE" ]; then
   hint "есть: $(ls /sys/class/net | tr '\n' ' ')"
   hint "задать другой: IFACE=eth0 $0"
 else
-  ok "состояние: $(cat /sys/class/net/$IFACE/operstate), MTU $(cat /sys/class/net/$IFACE/mtu)"
+  ok "состояние: $(cat /sys/class/net/$IFACE/operstate)"
+  MTU=$(cat "/sys/class/net/$IFACE/mtu")
+  # XDP требует, чтобы кадр влезал в страницу 4 КБ за вычетом headroom и
+  # служебных структур; у ENA предел ~3498. При jumbo (в VPC по умолчанию 9001)
+  # XDP-программа просто не навешивается.
+  if [ "$MTU" -gt 3498 ]; then
+    warn "MTU $MTU — XDP не навесится (предел около 3498)"
+    hint "  sudo ip link set $IFACE mtu 1500     # наши кадры не больше 258 байт"
+  else
+    ok "MTU: $MTU"
+  fi
   ok "MAC: $(cat /sys/class/net/$IFACE/address)"
-  IP=$(ip -4 -o addr show "$IFACE" | awk '{print $4}')
+  IP=$(ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{print $4}')
   [ -n "$IP" ] && ok "IPv4: $IP" || warn "нет IPv4 — src-ip для отправителя взять неоткуда"
   if have ethtool; then
     DRV=$(ethtool -i "$IFACE" 2>/dev/null | awk '/^driver:/{print $2}')
-    ok "драйвер: ${DRV:-неизвестен}"
+    [ -n "$DRV" ] && ok "драйвер: $DRV" || warn "ethtool -i не отвечает — интерфейс поднят?"
     COMBINED=$(ethtool -l "$IFACE" 2>/dev/null | awk '/^Combined:/{c=$2} END{print c}')
     if [ "${COMBINED:-1}" -gt 1 ]; then
       warn "очередей $COMBINED, а AF_XDP слушает только queue 0 — RSS раскидает поток мимо"
       hint "  sudo ethtool -L $IFACE combined 1"
     else
       ok "очередей: 1 (весь поток попадёт в queue 0)"
+    fi
+    KOUT=$(ethtool -k "$IFACE" 2>/dev/null)
+    OFFL=$(printf '%s\n' "$KOUT" | grep -E '^(generic-receive-offload|generic-segmentation-offload|tcp-segmentation-offload): on' | cut -d: -f1 | tr '\n' ' ')
+    if [ -z "$KOUT" ]; then
+      warn "ethtool -k не отвечает (интерфейс поднят?) — оффлоады не проверены"
+    elif [ -n "$OFFL" ]; then
+      warn "включены оффлоады: $OFFL — могут склеить или нарезать наши кадры"
+      hint "  sudo ethtool -K $IFACE gro off gso off tso off"
+    else
+      ok "gro/gso/tso выключены"
     fi
   else
     warn "нет ethtool"; hint "  sudo apt install -y ethtool"
