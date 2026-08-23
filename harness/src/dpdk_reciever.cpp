@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
   while (!g_stop) {
     uint16_t n = receiver.receive(burst, cfg.burst);
     ++stats.bursts;
-    stats.burst_pkts++;
+    stats.burst_pkts += n;
     if (n==0) [[unlikely]] {
       ++stats.empty_spins;
       continue;
