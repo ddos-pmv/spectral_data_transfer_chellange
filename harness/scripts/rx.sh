@@ -17,6 +17,7 @@ ENI_INDEX=${ENI_INDEX:-1}               # device-index ENI, отданной DPD
 PORT=${PORT:-40001}
 COUNT=${COUNT:-1000000}                 # замеров, после них consumer выходит
 WARMUP=${WARMUP:-20000}                 # съедается и выбрасывается до записи
+IDLE_MS=${IDLE_MS:-2000}                # тишина дольше этого = отправитель кончился
 SLOTS=${SLOTS:-1024}
 BURST=${BURST:-32}
 CPU_RECEIVER=${CPU_RECEIVER:-0}
@@ -77,5 +78,6 @@ for _ in $(seq 50); do [ -e /dev/shm/fanout_ring_rx ] && break; sleep 0.1; done
 
 taskset -c "$CPU_CONSUMER" setarch -R ./bin/consumer \
   --shm /fanout_ring_rx --slots "$SLOTS" --from-edge \
-  --count "$COUNT" --warmup "$WARMUP" --csv "$RUN/latencies.csv" \
+  --count "$COUNT" --warmup "$WARMUP" --idle-ms "$IDLE_MS" \
+  --csv "$RUN/latencies.csv" \
   2>&1 | tee "$RUN/consumer.log"
