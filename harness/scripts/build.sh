@@ -58,10 +58,7 @@ if [ "$WITH_IGB_UIO" = 1 ]; then
   depmod -a
   # Без WC каждая запись LLQ-дескриптора уезжает отдельной PCIe-транзакцией.
   # Проверить, что WC реально активен: ./scripts/nic.sh status во время прогона.
-  echo "options igb_uio wc_activate=1" > /etc/modprobe.d/igb_uio.conf
-  modprobe uio
-  modprobe igb_uio
-  grep -q igb_uio /proc/modules && ok "igb_uio загружен"
+  ensure_igb_uio
 fi
 
 say "Готово"

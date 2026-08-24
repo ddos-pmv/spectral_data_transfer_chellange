@@ -563,7 +563,7 @@ curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
 
 ```bash
 sudo modprobe uio
-sudo modprobe igb_uio                  # wc_activate=1 прописан в /etc/modprobe.d/
+sudo modprobe igb_uio wc_activate=1    # параметр только при загрузке модуля
 sudo ip link set enp40s0 down          # своё имя из dpdk-devbind.py --status
 dpdk-devbind.py --status               # найти PCI-адрес нужной карты
 sudo dpdk-devbind.py --bind=igb_uio 0000:28:00.0    # свой адрес из --status
@@ -574,6 +574,10 @@ dpdk-devbind.py --status | head -20
 а интерфейс — пропасть из `ip a`. SSH на `ens5` при этом не моргает.
 
 Модуль не переживает перезагрузку — после reboot повторить `modprobe` и `--bind`.
+`wc_activate` **нельзя** применить к уже загруженному модулю: если `igb_uio` подняли
+без него, нужен `rmmod` (карта при этом должна быть отвязана). `nic.sh bind` делает
+это сам — пишет `/etc/modprobe.d/igb_uio.conf`, и если модуль загружен, но к нему
+ничего не привязано, перезагружает его начисто.
 Это, кстати, встроенная страховка: если что-то пошло не так, достаточно перезагрузить
 машину, и карта сама вернётся ядру.
 

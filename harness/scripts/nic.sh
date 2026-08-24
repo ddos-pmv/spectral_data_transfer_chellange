@@ -91,8 +91,7 @@ cmd_bind() {
 
   say "Привязка $pci к $DPDK_DRIVER"
   if [ "$DPDK_DRIVER" = igb_uio ]; then
-    modprobe uio
-    modprobe igb_uio || die "igb_uio не собран -- сначала ./scripts/build.sh"
+    ensure_igb_uio || die "igb_uio не собран -- сначала sudo ./scripts/build.sh"
   else
     modprobe "$DPDK_DRIVER"
   fi

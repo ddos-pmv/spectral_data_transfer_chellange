@@ -147,3 +147,43 @@ local_ip() {
     eni_addrs "$DPDK_ENI_INDEX" 2>/dev/null | awk '{print $2}'
   fi
 }
+
+# ---------------------------------------------------------------- igb_uio
+IGB_UIO_CONF=/etc/modprobe.d/igb_uio.conf
+
+# Загрузить igb_uio так, чтобы wc_activate=1 точно применился.
+#
+# Без Write Combining LLQ пишет дескрипторы в память устройства отдельными
+# несливаемыми транзакциями -- ради этого igb_uio и берётся вместо vfio-pci.
+# Проверить постфактум нельзя: wc_activate объявлен с правами 0 и в
+# /sys/module/igb_uio/parameters/ не появляется. Значит гарантировать надо
+# в момент загрузки, а уже загруженному модулю параметр не подсунуть.
+ensure_igb_uio() {
+  local want="options igb_uio wc_activate=1"
+  if [ "$(cat "$IGB_UIO_CONF" 2>/dev/null)" != "$want" ]; then
+    echo "$want" > "$IGB_UIO_CONF" || return 1
+    ok "записан $IGB_UIO_CONF"
+  fi
+  modprobe uio
+
+  if ! grep -q '^igb_uio ' /proc/modules; then
+    modprobe igb_uio wc_activate=1 || return 1
+    ok "igb_uio загружен с wc_activate=1"
+    return 0
+  fi
+
+  # Уже загружен, и с каким параметром -- неизвестно. Если к нему ничего не
+  # привязано, перезагружаем начисто. Если привязано -- трогать нельзя.
+  local bound
+  bound=$(ls /sys/bus/pci/drivers/igb_uio/ 2>/dev/null | grep -c '^0000:' || true)
+  if [ "${bound:-0}" = 0 ]; then
+    if rmmod igb_uio 2>/dev/null && modprobe igb_uio wc_activate=1; then
+      ok "igb_uio перезагружен с wc_activate=1"
+      return 0
+    fi
+  fi
+  warn "igb_uio уже загружен (устройств привязано: ${bound:-0}), параметр не проверить"
+  echo "     гарантировать WC: sudo ./scripts/nic.sh unbind && sudo rmmod igb_uio,"
+  echo "     затем sudo ./scripts/nic.sh bind"
+  return 0
+}

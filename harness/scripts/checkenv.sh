@@ -53,8 +53,18 @@ if [ -n "$PMDS" ]; then
 else
   note "каталог pmds-* не найден -- EAL не увидит драйверы"
 fi
-lsmod 2>/dev/null | grep -q '^igb_uio' && ok "igb_uio загружен" \
-  || warn "igb_uio не загружен -- нужен для ENA PMD с Write Combining"
+if lsmod 2>/dev/null | grep -q '^igb_uio'; then
+  ok "igb_uio загружен"
+else
+  warn "igb_uio не загружен -- поднимется при ./scripts/nic.sh bind"
+fi
+# Файл нужен, чтобы модуль поднимался с WC и при загрузке системы, а не только
+# из наших скриптов. Проверить сам параметр нельзя: он объявлен с правами 0.
+if grep -q 'wc_activate=1' /etc/modprobe.d/igb_uio.conf 2>/dev/null; then
+  ok "wc_activate=1 в /etc/modprobe.d/igb_uio.conf"
+else
+  note "нет wc_activate=1 в /etc/modprobe.d/igb_uio.conf -- LLQ пойдёт через UC"
+fi
 
 # ------------------------------------------------------------------ сборка
 say "Бинари"
