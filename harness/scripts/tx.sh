@@ -38,11 +38,18 @@ mkdir -p "$RUN"
 rm -f /dev/shm/fanout_ring
 
 PRODUCER=
+SENDER=
 cleanup() {
+  # Отправителя гасим первым и дожидаемся: по SIGTERM он допечатывает статистику.
+  [ -n "$SENDER" ] && kill -TERM "$SENDER" 2>/dev/null || true
+  [ -n "$SENDER" ] && wait "$SENDER" 2>/dev/null || true
   [ -n "$PRODUCER" ] && kill -TERM "$PRODUCER" 2>/dev/null || true
   [ -n "$PRODUCER" ] && wait "$PRODUCER" 2>/dev/null || true
   rm -f /dev/shm/fanout_ring
   [ -n "${SUDO_UID:-}" ] && chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$RUN" || true
+  echo
+  echo "статистика отправителя: $RUN/sender.log"
+  tail -n 9 "$RUN/sender.log" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -63,9 +70,17 @@ PRODUCER=$!
 for _ in $(seq 50); do [ -e /dev/shm/fanout_ring ] && break; sleep 0.1; done
 [ -e /dev/shm/fanout_ring ] || die "producer не создал кольцо, см. $RUN/producer.log"
 
+# В файл и фоном, а не в конвейер: по Ctrl+C сигнал прилетает всей группе
+# процессов переднего плана, tee умирает первым, и статистика отправителя
+# уходит в закрытую трубу -- SIGPIPE убивает его на середине вывода.
 taskset -c "$CPU_SENDER" setarch -R ./bin/dpdk_sender \
   -l "$CPU_SENDER" --file-prefix tx \
   $DEV \
   -- --shm /fanout_ring --slots "$SLOTS" \
      --dst-mac "$PEER_MAC" --src-ip "$SRC_IP" --dst-ip "$PEER_IP" \
-     --dst-port "$PORT" --burst "$BURST" 2>&1 | tee "$RUN/sender.log"
+     --dst-port "$PORT" --burst "$BURST" \
+  > "$RUN/sender.log" 2>&1 &
+SENDER=$!
+
+echo "   идёт отправка, Ctrl+C для остановки"
+wait "$SENDER" 2>/dev/null || true
