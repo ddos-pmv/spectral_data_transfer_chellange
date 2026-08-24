@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Стартер DPDK-цепочки по TOML-конфигу.
 
-    sudo ./scripts/dpdk.py [config.toml]     # по умолчанию scripts/dpdk.toml
+    sudo ./scripts/dpdk.py [config.toml]     # по умолчанию scripts/dpdk_local_bench.toml
 
 Скрипт не знает, что такое producer или sender: он запускает процессы из
 [[proc]] по порядку, рендеря args/eal в флаги, ждёт завершения последнего и
 гасит остальных. Логи — в results/<ts>/r<N>-<name>.log.
 
 Стенд (veth-пара, huge-страницы, isolcpus) поднимается ОДИН РАЗ руками --
-команды в шапке dpdk.toml. Скрипт его только проверяет и печатает, что видит:
+команды в шапке dpdk_local_bench.toml. Скрипт его только проверяет и печатает, что видит:
 состояние стенда должно быть воспроизводимым и зафиксированным в описании
 решения, а не пересоздаваться неявно на каждом прогоне.
 
@@ -74,7 +74,7 @@ def check_env(env):
             continue
         state = Path(f"/sys/class/net/{iface}/operstate")
         if not state.exists():
-            sys.exit(f"нет интерфейса {iface} — подними стенд, см. шапку dpdk.toml")
+            sys.exit(f"нет интерфейса {iface} — подними стенд, см. шапку dpdk_local_bench.toml")
         if state.read_text().strip() not in ("up", "unknown"):
             print(f"  ВНИМАНИЕ: {iface} не поднят  (ip link set {iface} up)")
 
@@ -176,7 +176,7 @@ def main():
     if os.geteuid() != 0:
         sys.exit("нужен root: sudo ./scripts/dpdk.py")
 
-    path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "dpdk.toml"
+    path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "dpdk_local_bench.toml"
     cfg = tomllib.loads(path.read_text())
     build()
     check_env(cfg.get("env", {}))

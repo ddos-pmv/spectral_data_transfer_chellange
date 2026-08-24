@@ -1,232 +1,95 @@
 #!/usr/bin/env bash
-# Проверка окружения для DPDK-прогона. НИЧЕГО НЕ МЕНЯЕТ:
-# только смотрит и печатает команды, которые нужно выполнить самому.
+# То, что скриптом не чинится: параметры загрузки, сборка, часы.
 #
 #   ./scripts/checkenv.sh
-#   IFACE=ens5 ./scripts/checkenv.sh
-set -uo pipefail
+#
+# Состояние железа (ядра, память, прерывания, карта) показывает host.sh status.
+set -euo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+cd "$ROOT_DIR"
 
-IFACE=${IFACE:-ens5}
+FAIL=0
+note() { bad "$*"; FAIL=$((FAIL + 1)); }
 
-WARNS=0
-sec()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-ok()   { printf '  \033[32mok  \033[0m %s\n' "$*"; }
-warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; WARNS=$((WARNS+1)); }
-hint() { printf '       %s\n' "$*"; }
-have() { command -v "$1" >/dev/null 2>&1; }
-
-read -r CMDLINE < /proc/cmdline
-ISOLATED=$(cat /sys/devices/system/cpu/isolated 2>/dev/null)
-NPROC=$(nproc)
-
-# Развернуть "2,4-6" в "2 4 5 6".
-expand() {
-  local part lo hi
-  for part in ${1//,/ }; do
-    lo=${part%-*}; hi=${part#*-}
-    for ((i=lo; i<=hi; i++)); do echo "$i"; done
-  done
+# ------------------------------------------------------------------- GRUB
+say "Параметры загрузки"
+CMDLINE=$(cat /proc/cmdline)
+row "/proc/cmdline" "$CMDLINE"
+echo
+want_param() {
+  local key=$1 why=$2 got
+  got=$(tr ' ' '\n' <<<"$CMDLINE" | grep "^$key=" || true)
+  if [ -n "$got" ]; then ok "$got"; else note "$key= нет -- $why"; fi
 }
+want_param isolcpus   "планировщик будет ставить чужие задачи на рабочее ядро"
+want_param nohz_full  "тик таймера 250/1000 раз в секунду попадёт в p99.9"
+want_param rcu_nocbs  "RCU-колбэки будут выполняться на рабочем ядре"
+want_param idle       "нужен idle=poll: выход из C1E стоит ~10 мкс, из C6 ~130"
+want_param transparent_hugepage "khugepaged берёт mmap_lock и даёт выбросы в хвосте"
 
-# ---------------------------------------------------------------- машина
-sec "Машина"
-ok "ядер: $NPROC"
-if have systemd-detect-virt && [ "$(systemd-detect-virt)" != none ]; then
-  ok "виртуализация: $(systemd-detect-virt)"
+# Ubuntu cloud-образ кладёт в /etc/default/grub.d/50-cloudimg-settings.cfg
+# присваивание GRUB_CMDLINE_LINUX_DEFAULT=..., которое затирает то, что написано
+# в /etc/default/grub. Признак: в cmdline нет даже quiet/splash.
+if ! grep -q 'idle=' <<<"$CMDLINE" && [ -f /etc/default/grub.d/50-cloudimg-settings.cfg ]; then
+  warn "правки в /etc/default/grub мог затереть grub.d/50-cloudimg-settings.cfg"
+  echo "     положите свои параметры в /etc/default/grub.d/99-hft.cfg и допишите"
+  echo "     \$GRUB_CMDLINE_LINUX_DEFAULT в конец, иначе они не доедут"
 fi
-if have curl; then
-  INST=$(curl -s --max-time 1 \
-    http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null)
-  case "${INST:-}" in
-    "") ;;
-    t2.*|t3.*|t4g.*)
-      ok "инстанс AWS: $INST"
-      warn "burstable-инстанс: CPU-кредиты и шумные соседи"
-      hint "числа по хвосту отсюда брать нельзя — только проверка работоспособности" ;;
-    *)  ok "инстанс AWS: $INST" ;;
-  esac
-fi
-if [ "$NPROC" -le 2 ]; then
-  warn "двух ядер не хватает на изоляцию (нужно ядро под ОС + по ядру на процесс)"
-  hint "эта машина годится для функциональной проверки, не для замеров"
-fi
-STEAL=$(awk '/^cpu /{print $9}' /proc/stat)
-[ "${STEAL:-0}" -gt 0 ] && warn "steal time не ноль ($STEAL тиков) — гипервизор отбирает такты"
+echo "   ядро молча игнорирует неизвестные параметры: опечатка выглядит как"
+echo "   рабочая строка. Перед reboot сверяйте: grep hft /boot/grub/grub.cfg"
 
-# ----------------------------------------------------------------- ядро
-sec "Параметры ядра"
-for p in isolcpus nohz_full rcu_nocbs irqaffinity; do
-  V=$(grep -o "\b$p=[^ ]*" <<<"$CMDLINE")
-  if [ -n "$V" ]; then ok "$V"; else warn "$p не задан"; fi
-done
-if [ -z "$ISOLATED" ]; then
-  hint "isolcpus убирает задачи, irqaffinity — прерывания. Это РАЗНЫЕ вещи."
-  hint "На облачной Ubuntu правка /etc/default/grub затирается файлами из"
-  hint "/etc/default/grub.d/ — класть надо туда, дополняя переменную:"
-  hint "  sudo tee /etc/default/grub.d/99-hft.cfg <<'EOF'"
-  hint "  GRUB_CMDLINE_LINUX_DEFAULT=\"\$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=1,2 nohz_full=1,2 rcu_nocbs=1,2 irqaffinity=0\""
-  hint "  EOF"
-  hint "  sudo update-grub && grep -o 'isolcpus=[^ ]*' /boot/grub/grub.cfg   # пусто = не применится"
-  hint "Номера ядер брать из lscpu -e: изолировать нужно РАЗНЫЕ физические CORE."
-fi
-
-# ------------------------------------------------------------- топология
-sec "Топология ядер"
-if [ -n "$ISOLATED" ]; then
-  ok "изолированы: $ISOLATED"
-  for c in $(expand "$ISOLATED"); do
-    SIB=$(cat "/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list" 2>/dev/null)
-    for s in $(expand "$SIB"); do
-      [ "$s" = "$c" ] && continue
-      if ! grep -qw "$s" <<<"$(expand "$ISOLATED" | tr '\n' ' ')"; then
-        warn "cpu$c изолирован, а его HT-сосед cpu$s — нет (делят L1/L2 и порты)"
-        hint "изолировать пару целиком или занимать только по одному ядру из пары"
-      fi
-    done
-  done
-else
-  warn "изолированных ядер нет — busy-spin процессы будут вытесняться планировщиком"
-fi
-
-# -------------------------------------------------------------- частоты
-sec "Частоты"
-GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
-if [ -z "$GOV" ]; then
-  ok "cpufreq недоступен (обычно так в облаке — частотой управляет гипервизор)"
-elif [ "$GOV" = performance ]; then
-  ok "governor: performance"
-else
-  warn "governor: $GOV"
-  hint "  sudo cpupower frequency-set -g performance"
-fi
-
-# --------------------------------------------------------------- память
-sec "Память"
-HP_TOTAL=$(awk '/HugePages_Total/{print $2}' /proc/meminfo)
-HP_FREE=$(awk '/HugePages_Free/{print $2}' /proc/meminfo)
-if [ "${HP_TOTAL:-0}" -gt 0 ]; then
-  ok "hugepages 2M: всего $HP_TOTAL, свободно $HP_FREE"
-  [ "$HP_FREE" -lt 512 ] && warn "мало свободных — возможно, висит недобитый процесс DPDK"
-else
-  warn "hugepages не выделены"
-  hint "  sudo sh -c 'echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'"
-fi
-THP=$(sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
-[ "$THP" = always ] && warn "THP=always — фоновая дефрагментация даёт выбросы в хвост" \
-  && hint "  sudo sh -c 'echo madvise > /sys/kernel/mm/transparent_hugepage/enabled'"
-ML=$(ulimit -l)
-if [ "$ML" = unlimited ] || [ "${ML:-0}" -ge 65536 ]; then ok "memlock: $ML"
-else warn "memlock $ML КБ маловато для umem AF_XDP (ulimit -l в сессии запуска)"; fi
-
-# ----------------------------------------------------------- прерывания
-sec "Прерывания"
-if pgrep -x irqbalance >/dev/null; then
-  warn "irqbalance работает и будет переносить прерывания обратно"
-  hint "  sudo systemctl stop irqbalance && sudo systemctl disable irqbalance"
-else
-  ok "irqbalance не запущен"
-fi
-if [ -n "$ISOLATED" ]; then
-  ISO=$(expand "$ISOLATED" | tr '\n' ' ')
-  FOUND=0
-  # Не счётчики из /proc/interrupts (они накопленные с загрузки и мало о чём
-  # говорят), а то, КУДА прерыванию вообще разрешено приходить.
-  for d in /proc/irq/[0-9]*; do
-    AFF=$(cat "$d/smp_affinity_list" 2>/dev/null) || continue
-    ALLOWED=" $(expand "$AFF" | tr '\n' ' ') "
-    for c in $ISO; do
-      case "$ALLOWED" in
-        *" $c "*)
-          NAME=$(ls "$d" 2>/dev/null | grep -vE '^(smp_affinity|smp_affinity_list|node|spurious|affinity_hint|effective_affinity|effective_affinity_list)$' | head -1)
-          warn "IRQ ${d##*/} (${NAME:-?}) разрешён на cpu$c (affinity: $AFF)"
-          FOUND=1; break ;;
-      esac
-    done
-  done
-  if [ "$FOUND" = 0 ]; then
-    ok "ни одно device-прерывание не нацелено на изолированные ядра"
-  else
-    hint "подвижные переносятся так:  echo 0-1 | sudo tee /proc/irq/<N>/smp_affinity_list"
-    hint "managed MSI-X (NVMe, ENA, Wi-Fi) так не переносятся — только irqaffinity= в GRUB"
-  fi
-  TRM=$(awk '$1=="TRM:"{s=0; for(i=2;i<=NF;i++) if($i ~ /^[0-9]+$/) s+=$i; print s}' /proc/interrupts)
-  [ "${TRM:-0}" -gt 0 ] && warn "термальных прерываний (TRM): $TRM — убрать нельзя, это пол по хвосту"
-  hint "динамика за интервал, а не с загрузки:  sudo ./scripts/irq.py 30 $ISOLATED"
-fi
-
-# ------------------------------------------------------------------ сеть
-sec "Сеть: $IFACE"
-if [ ! -e "/sys/class/net/$IFACE" ]; then
-  warn "интерфейса $IFACE нет"
-  hint "есть: $(ls /sys/class/net | tr '\n' ' ')"
-  hint "задать другой: IFACE=eth0 $0"
-else
-  ok "состояние: $(cat /sys/class/net/$IFACE/operstate)"
-  MTU=$(cat "/sys/class/net/$IFACE/mtu")
-  # XDP требует, чтобы кадр влезал в страницу 4 КБ за вычетом headroom и
-  # служебных структур; у ENA предел ~3498. При jumbo (в VPC по умолчанию 9001)
-  # XDP-программа просто не навешивается.
-  if [ "$MTU" -gt 3498 ]; then
-    warn "MTU $MTU — XDP не навесится (предел около 3498)"
-    hint "  sudo ip link set $IFACE mtu 1500     # наши кадры не больше 258 байт"
-  else
-    ok "MTU: $MTU"
-  fi
-  ok "MAC: $(cat /sys/class/net/$IFACE/address)"
-  IP=$(ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{print $4}')
-  [ -n "$IP" ] && ok "IPv4: $IP" || warn "нет IPv4 — src-ip для отправителя взять неоткуда"
-  if have ethtool; then
-    DRV=$(ethtool -i "$IFACE" 2>/dev/null | awk '/^driver:/{print $2}')
-    [ -n "$DRV" ] && ok "драйвер: $DRV" || warn "ethtool -i не отвечает — интерфейс поднят?"
-    # В выводе ethtool -l первый Combined -- максимум, последний -- текущее.
-    QLINES=$(ethtool -l "$IFACE" 2>/dev/null | awk '/^Combined:/{print $2}')
-    MAXQ=$(printf '%s\n' "$QLINES" | head -1)
-    COMBINED=$(printf '%s\n' "$QLINES" | tail -1)
-    if [ "${COMBINED:-1}" -gt 1 ]; then
-      warn "очередей $COMBINED, а AF_XDP слушает только queue 0 — RSS раскидает поток мимо"
-      hint "  sudo ethtool -L $IFACE combined 1"
-    else
-      ok "очередей: 1 (весь поток попадёт в queue 0)"
-    fi
-    # ENA резервирует под XDP по TX-очереди на каждую рабочую: нужно current*2 <= max.
-    if [ -n "${MAXQ:-}" ] && [ "$MAXQ" -lt 2 ]; then
-      warn "максимум очередей $MAXQ — XDP на этом интерфейсе не поднимется вовсе"
-      hint "  ENA требует 'рабочих x 2 <= максимума'; лечится инстансом побольше"
-      hint "  либо режимом А (ENA PMD), он XDP не использует — AWS.md, раздел 8"
-    fi
-    KOUT=$(ethtool -k "$IFACE" 2>/dev/null)
-    OFFL=$(printf '%s\n' "$KOUT" | grep -E '^(generic-receive-offload|generic-segmentation-offload|tcp-segmentation-offload): on' | cut -d: -f1 | tr '\n' ' ')
-    if [ -z "$KOUT" ]; then
-      warn "ethtool -k не отвечает (интерфейс поднят?) — оффлоады не проверены"
-    elif [ -n "$OFFL" ]; then
-      warn "включены оффлоады: $OFFL — могут склеить или нарезать наши кадры"
-      hint "  sudo ethtool -K $IFACE gro off gso off tso off"
-    else
-      ok "gro/gso/tso выключены"
-    fi
-  else
-    warn "нет ethtool"; hint "  sudo apt install -y ethtool"
-  fi
-fi
-
-# ------------------------------------------------------------------ DPDK
-sec "DPDK"
-if have pkg-config && pkg-config --exists libdpdk; then
+# ------------------------------------------------------------------- DPDK
+say "DPDK"
+if pkg-config --exists libdpdk 2>/dev/null; then
   ok "libdpdk $(pkg-config --modversion libdpdk)"
-  PMDS=$(find "$(pkg-config --variable=libdir libdpdk)" -path '*pmds*' -name 'librte_net_af_xdp.so*' 2>/dev/null | head -1)
-  if [ -n "$PMDS" ]; then ok "драйвер af_xdp: $PMDS"
-  else warn "librte_net_af_xdp.so не найден — PMD подгружается в рантайме, без него vdev не поднимется"; fi
-  # Без пайпа в grep -q: при set -o pipefail ранний выход grep роняет ldconfig по SIGPIPE.
-  LDCACHE=$(ldconfig -p 2>/dev/null)
-  case "$LDCACHE" in
-    *librte_eal*) ok "librte_* в кэше ldconfig (PMD подгружаются в рантайме)" ;;
-    *) warn "librte_* не в кэше ldconfig — EAL не найдёт драйверы"
-       hint "  echo $(pkg-config --variable=libdir libdpdk) | sudo tee /etc/ld.so.conf.d/dpdk.conf && sudo ldconfig" ;;
-  esac
 else
-  warn "pkg-config не видит libdpdk — dpdk_* цели не соберутся"
+  note "libdpdk не найден -- sudo ./scripts/build.sh"
 fi
-[ -x ../bin/dpdk_sender ] && ok "bin/dpdk_sender собран" || warn "bin/dpdk_sender нет: make -j\$(nproc)"
+PMDS=$(find /usr/local/lib/x86_64-linux-gnu -maxdepth 2 -type d -name 'pmds-*' 2>/dev/null | head -1)
+if [ -n "$PMDS" ]; then
+  for d in net_ena net_af_xdp; do
+    [ -e "$PMDS/librte_$d.so" ] && ok "$d" || warn "$d не собран"
+  done
+else
+  note "каталог pmds-* не найден -- EAL не увидит драйверы"
+fi
+lsmod 2>/dev/null | grep -q '^igb_uio' && ok "igb_uio загружен" \
+  || warn "igb_uio не загружен -- нужен для ENA PMD с Write Combining"
 
-printf '\n'
-[ "$WARNS" = 0 ] && printf '\033[32mвсё чисто\033[0m\n' || printf '\033[33mпредупреждений: %s\033[0m\n' "$WARNS"
+# ------------------------------------------------------------------ сборка
+say "Бинари"
+for b in producer consumer dpdk_sender dpdk_reciever; do
+  if [ -x "bin/$b" ]; then
+    ok "bin/$b"
+  else
+    note "bin/$b нет -- make -j\$(nproc)"
+  fi
+done
+
+# ------------------------------------------------------------------- часы
+say "Часы"
+# Замеры считаются как recv_ts(машина B) - send_ts(машина A) по CLOCK_REALTIME,
+# поэтому расхождение часов входит в результат один в один. При 4 мкс медианы
+# смещение в 6 мкс делает измерение бессмысленным.
+if command -v chronyc >/dev/null 2>&1 && chronyc tracking >/dev/null 2>&1; then
+  chronyc tracking | grep -E 'Reference ID|System time|Frequency|Root dispersion|Update interval' | sed 's/^/   /'
+  echo
+  OFF=$(chronyc tracking | awk '/System time/ {print $4}')
+  row "смещение, с" "$OFF"
+  warn "chrony непрерывно подкручивает частоту, поэтому смещение не константа."
+  echo "     Перед серией замеров остановить его на ОБЕИХ машинах:"
+  echo "       sudo systemctl stop chrony"
+  echo "     и прогонять в обе стороны: d = (AB+BA)/2, смещение = (AB-BA)/2"
+else
+  warn "chronyd не отвечает (остановлен для замеров?)"
+fi
+if ls /dev/ptp* >/dev/null 2>&1; then
+  ok "PHC есть: $(ls /dev/ptp*)"
+else
+  row "PHC" "нет -- ENA на этих инстансах его не отдаёт, только Amazon Time Sync"
+fi
+
+say "Итого"
+[ "$FAIL" = 0 ] && ok "всё на месте" || bad "проблем: $FAIL"
+echo "   состояние железа: ./scripts/host.sh status"
+exit 0

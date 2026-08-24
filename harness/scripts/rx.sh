@@ -1,48 +1,38 @@
 #!/usr/bin/env bash
-# Принимающая сторона: сеть -> dpdk_reciever -> shm -> consumer.
+# Приёмная сторона: сеть -> dpdk_reciever -> shm -> consumer.
 #
-# Запускать ПЕРВЫМ, до tx.sh на отправляющей машине.
-# Завершается сам, когда consumer наберёт COUNT замеров.
+# Запускать ПЕРВЫМ, до tx.sh на отправляющей машине. Завершается сам, когда
+# consumer наберёт COUNT замеров или замолчит отправитель (IDLE_MS).
 #
 #   sudo ./scripts/rx.sh
-#   sudo COUNT=3000000 ./scripts/rx.sh
+#   sudo COUNT=3000000 IDLE_MS=60000 ./scripts/rx.sh
+#
+# Карта, ядра и порт берутся из scripts/host.conf.
 set -euo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+cd "$ROOT_DIR"
 
-IFACE=${IFACE:-ens5}                    # интерфейс, на который приходит трафик
-# Устройство для EAL. По умолчанию AF_XDP поверх живого интерфейса (ядро видит
-# карту, SSH не теряется). Для ENA PMD передайте адрес PCI, привязанный к
-# igb_uio:  EAL_DEV="-a 0000:28:00.0"  — см. AWS.md, раздел 8.
-EAL_DEV=${EAL_DEV:-"--vdev net_af_xdp0,iface=$IFACE,start_queue=0,queue_count=1"}
-ENI_INDEX=${ENI_INDEX:-1}               # device-index ENI, отданной DPDK (режим А)
-PORT=${PORT:-40001}
-COUNT=${COUNT:-1000000}                 # замеров, после них consumer выходит
-WARMUP=${WARMUP:-20000}                 # съедается и выбрасывается до записи
-IDLE_MS=${IDLE_MS:-2000}                # тишина дольше этого = отправитель кончился
+COUNT=${COUNT:-1000000}       # замеров, после них consumer выходит
+WARMUP=${WARMUP:-20000}       # первые замеры делаются и выбрасываются
+IDLE_MS=${IDLE_MS:-2000}      # тишина дольше этого = отправитель кончился
 SLOTS=${SLOTS:-1024}
 BURST=${BURST:-32}
-CPU_RECEIVER=${CPU_RECEIVER:-0}
-CPU_CONSUMER=${CPU_CONSUMER:-1}
 
-cd "$(dirname "$0")/.."
-. scripts/dpdk-eni.sh
-[ "$(id -u)" = 0 ] || { echo "нужен root: hugepages и AF_XDP требуют привилегий"; exit 1; }
-[ -x bin/dpdk_reciever ] || { echo "нет bin/dpdk_reciever — соберите: make -j\$(nproc)"; exit 1; }
+need_root
+[ -x bin/dpdk_reciever ] || die "нет bin/dpdk_reciever -- make -j\$(nproc)"
+DEV=$(eal_dev)
 
-# Печатаем адреса той карты, которую слушает DPDK. В режиме ядра это $IFACE,
-# в режиме PMD карта ядру не видна — берём из метаданных инстанса.
-echo "приёмная машина: подставить в tx.sh --"
+# Печатаем адреса той карты, которую слушает DPDK: в режиме PMD ядру она не
+# видна, и MAC с IP взять больше неоткуда, кроме метаданных инстанса.
+say "Вписать в host.conf отправляющей машины"
 if kernel_mode; then
-  ip -o link show "$IFACE" | awk '{print "    PEER_MAC="$(NF-2)}'
-  ip -4 -o addr show "$IFACE" | awk '{split($4,a,"/"); print "    DST_IP="a[1]}'
+  row PEER_MAC "$(cat "/sys/class/net/$DPDK_IFACE/address")"
+  row PEER_IP "$(local_ip)"
+elif ADDRS=$(eni_addrs "$DPDK_ENI_INDEX"); then
+  row PEER_MAC "$(awk '{print $1}' <<<"$ADDRS")"
+  row PEER_IP "$(awk '{print $2}' <<<"$ADDRS")"
 else
-  ADDRS=$(eni_addrs "$ENI_INDEX") || ADDRS=""
-  if [ -n "$ADDRS" ]; then
-    read -r ENI_MAC ENI_IP <<<"$ADDRS"
-    echo "    PEER_MAC=$ENI_MAC"
-    echo "    DST_IP=$ENI_IP"
-  else
-    echo "    (не удалось прочитать ENI $ENI_INDEX из метаданных — задайте вручную)"
-  fi
+  bad "IMDS не ответил -- задайте адреса вручную"
 fi
 
 RUN=results/rx-$(date +%Y%m%d-%H%M%S)
@@ -51,7 +41,7 @@ rm -f /dev/shm/fanout_ring_rx
 
 RECEIVER=
 cleanup() {
-  # SIGTERM, а не kill: ресивер по нему допечатывает свою статистику.
+  # SIGTERM, а не kill: по нему ресивер допечатывает статистику.
   [ -n "$RECEIVER" ] && kill -TERM "$RECEIVER" 2>/dev/null || true
   [ -n "$RECEIVER" ] && wait "$RECEIVER" 2>/dev/null || true
   rm -f /dev/shm/fanout_ring_rx
@@ -62,19 +52,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "rx: слушаю udp/$PORT, жду $COUNT сообщений ($EAL_DEV)"
-echo "    логи: $RUN"
+say "Приём"
+row порт "udp/$PORT"
+row устройство "$DEV"
+row ядра "приёмник $CPU_RECEIVER, consumer $CPU_CONSUMER"
+row ждём "$COUNT сообщений"
+row логи "$RUN"
 
 taskset -c "$CPU_RECEIVER" setarch -R ./bin/dpdk_reciever \
   -l "$CPU_RECEIVER" --file-prefix rx \
-  $EAL_DEV \
+  $DEV \
   -- --shm /fanout_ring_rx --slots "$SLOTS" --port "$PORT" --burst "$BURST" \
   > "$RUN/receiver.log" 2>&1 &
 RECEIVER=$!
 
 # Кольцо создаёт ресивер; consumer открывает уже готовое.
 for _ in $(seq 50); do [ -e /dev/shm/fanout_ring_rx ] && break; sleep 0.1; done
-[ -e /dev/shm/fanout_ring_rx ] || { echo "ресивер не поднялся, см. $RUN/receiver.log"; exit 1; }
+[ -e /dev/shm/fanout_ring_rx ] || die "ресивер не поднялся, см. $RUN/receiver.log"
 
 taskset -c "$CPU_CONSUMER" setarch -R ./bin/consumer \
   --shm /fanout_ring_rx --slots "$SLOTS" --from-edge \

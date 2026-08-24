@@ -39,7 +39,7 @@ wait_shm = "/dev/shm/fanout_ring"   # ждать появления, прежд�
 shm = "/fanout_ring"
 slots = 1024
 count = 0            # 0 = без ограничения, остановим сигналом
-rate = 300_000       # msg/s, 0 = без троттлинга
+rate = 550_000       # msg/s, 0 = без троттлинга
 type = "mixed"       # trade | bbo | book | mixed
 
 
@@ -68,7 +68,7 @@ vdev = "net_af_xdp0,iface=veth-tx,start_queue=0,queue_count=1"
 [proc.args]
 shm = "/fanout_ring"
 slots = 1024
-dst-mac = "02:00:00:00:00:02"
+dst-mac = "86:c1:68:a5:6e:3c"
 src-ip = "10.0.0.1"
 dst-ip = "10.0.0.2"
 dst-port = 40001

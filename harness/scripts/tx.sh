@@ -4,43 +4,33 @@
 # Запускать ВТОРЫМ, после rx.sh на приёмной машине.
 # Останавливать Ctrl+C: оба процесса допечатают статистику.
 #
-#   sudo PEER_MAC=06:aa:.. DST_IP=172.31.5.20 ./scripts/tx.sh
-#   sudo PEER_MAC=.. DST_IP=.. RATE=500000 BURST=8 ./scripts/tx.sh
+#   sudo ./scripts/tx.sh
+#   sudo RATE=500000 BURST=8 ./scripts/tx.sh
+#
+# Адрес получателя (PEER_MAC/PEER_IP) берётся из scripts/host.conf -- его
+# печатает rx.sh на приёмной машине.
 set -euo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+cd "$ROOT_DIR"
 
-IFACE=${IFACE:-ens5}                    # интерфейс, через который уходит трафик
-# Устройство для EAL. По умолчанию AF_XDP поверх живого интерфейса (ядро видит
-# карту, SSH не теряется). Для ENA PMD передайте адрес PCI, привязанный к
-# igb_uio:  EAL_DEV="-a 0000:28:00.0"  — см. AWS.md, раздел 8.
-EAL_DEV=${EAL_DEV:-"--vdev net_af_xdp0,iface=$IFACE,start_queue=0,queue_count=1"}
-ENI_INDEX=${ENI_INDEX:-1}               # device-index ENI, отданной DPDK (режим А)
-PEER_MAC=${PEER_MAC:?укажите MAC приёмной машины (ip link show <iface> на ней)}
-DST_IP=${DST_IP:?укажите приватный IP приёмной машины}
-SRC_IP=${SRC_IP:-}                      # пусто = взять с IFACE
-DST_PORT=${DST_PORT:-40001}
-RATE=${RATE:-200000}                    # msg/s, 0 = без троттлинга
-TYPE=${TYPE:-mixed}                     # trade | bbo | book | mixed
+RATE=${RATE:-200000}          # msg/s, 0 = без троттлинга
+TYPE=${TYPE:-mixed}           # trade | bbo | book | mixed
 SLOTS=${SLOTS:-1024}
 BURST=${BURST:-32}
-CPU_PRODUCER=${CPU_PRODUCER:-0}
-CPU_SENDER=${CPU_SENDER:-1}
 
-cd "$(dirname "$0")/.."
-. scripts/dpdk-eni.sh
-[ "$(id -u)" = 0 ] || { echo "нужен root: hugepages и AF_XDP требуют привилегий"; exit 1; }
-[ -x bin/dpdk_sender ] || { echo "нет bin/dpdk_sender — соберите: make -j\$(nproc)"; exit 1; }
+need_root
+[ -x bin/dpdk_sender ] || die "нет bin/dpdk_sender -- make -j\$(nproc)"
+[ -n "$PEER_MAC" ] || die "PEER_MAC пуст: запустите rx.sh на приёмной машине и впишите в host.conf"
+[ -n "$PEER_IP" ]  || die "PEER_IP пуст: там же"
 
-# VPC режет пакеты, у которых src IP не совпадает с адресом ENI, поэтому адрес
-# берём с той самой карты, через которую уходит трафик, а не с любой соседней.
-if [ -z "$SRC_IP" ]; then
-  if kernel_mode; then
-    SRC_IP=$(ip -4 -o addr show "$IFACE" | awk '{print $4}' | cut -d/ -f1)
-  else
-    ADDRS=$(eni_addrs "$ENI_INDEX") || ADDRS=""
-    [ -n "$ADDRS" ] && read -r _ SRC_IP <<<"$ADDRS"
-  fi
-fi
-[ -n "$SRC_IP" ] || { echo "не удалось определить src IP — задайте SRC_IP=..."; exit 1; }
+DEV=$(eal_dev)
+SRC_IP=${SRC_IP:-$(local_ip)}
+[ -n "$SRC_IP" ] || die "не определить свой IP -- задайте SRC_IP=..."
+
+# Чужой отправитель, переживший Ctrl+C прошлого прогона, удваивает нагрузку:
+# пакеты упираются в PPS-лимит ENI, и в замерах появляются потери и хвост в мс.
+STALE=$(pgrep -x 'producer|dpdk_sender' | tr '\n' ' ' || true)
+[ -z "$STALE" ] || die "уже запущены producer/dpdk_sender (pid: $STALE) -- добейте их"
 
 RUN=results/tx-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$RUN"
@@ -55,8 +45,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "tx: $SRC_IP -> $DST_IP:$DST_PORT ($PEER_MAC), rate=$RATE ($EAL_DEV)"
-echo "    логи: $RUN"
+say "Отправка"
+row маршрут "$SRC_IP -> $PEER_IP:$PORT"
+row "MAC получателя" "$PEER_MAC"
+row устройство "$DEV"
+row ядра "producer $CPU_PRODUCER, отправитель $CPU_SENDER"
+row темп "$RATE msg/s, тип $TYPE"
+row логи "$RUN"
 
 taskset -c "$CPU_PRODUCER" setarch -R ./bin/producer \
   --shm /fanout_ring --slots "$SLOTS" --count 0 --rate "$RATE" --type "$TYPE" \
@@ -65,11 +60,11 @@ PRODUCER=$!
 
 # Кольцо должно существовать до старта отправителя: он открывает его с create=false.
 for _ in $(seq 50); do [ -e /dev/shm/fanout_ring ] && break; sleep 0.1; done
-[ -e /dev/shm/fanout_ring ] || { echo "producer не создал кольцо, см. $RUN/producer.log"; exit 1; }
+[ -e /dev/shm/fanout_ring ] || die "producer не создал кольцо, см. $RUN/producer.log"
 
 taskset -c "$CPU_SENDER" setarch -R ./bin/dpdk_sender \
   -l "$CPU_SENDER" --file-prefix tx \
-  $EAL_DEV \
+  $DEV \
   -- --shm /fanout_ring --slots "$SLOTS" \
-     --dst-mac "$PEER_MAC" --src-ip "$SRC_IP" --dst-ip "$DST_IP" \
-     --dst-port "$DST_PORT" --burst "$BURST" 2>&1 | tee "$RUN/sender.log"
+     --dst-mac "$PEER_MAC" --src-ip "$SRC_IP" --dst-ip "$PEER_IP" \
+     --dst-port "$PORT" --burst "$BURST" 2>&1 | tee "$RUN/sender.log"
