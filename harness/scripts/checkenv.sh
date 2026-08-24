@@ -60,9 +60,14 @@ for p in isolcpus nohz_full rcu_nocbs irqaffinity; do
   if [ -n "$V" ]; then ok "$V"; else warn "$p не задан"; fi
 done
 if [ -z "$ISOLATED" ]; then
-  hint "добавить в /etc/default/grub, GRUB_CMDLINE_LINUX_DEFAULT, затем update-grub и reboot:"
-  hint "  isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3 irqaffinity=0,1"
-  hint "  isolcpus убирает задачи, irqaffinity — прерывания. Это РАЗНЫЕ вещи."
+  hint "isolcpus убирает задачи, irqaffinity — прерывания. Это РАЗНЫЕ вещи."
+  hint "На облачной Ubuntu правка /etc/default/grub затирается файлами из"
+  hint "/etc/default/grub.d/ — класть надо туда, дополняя переменную:"
+  hint "  sudo tee /etc/default/grub.d/99-hft.cfg <<'EOF'"
+  hint "  GRUB_CMDLINE_LINUX_DEFAULT=\"\$GRUB_CMDLINE_LINUX_DEFAULT isolcpus=1,2 nohz_full=1,2 rcu_nocbs=1,2 irqaffinity=0\""
+  hint "  EOF"
+  hint "  sudo update-grub && grep -o 'isolcpus=[^ ]*' /boot/grub/grub.cfg   # пусто = не применится"
+  hint "Номера ядер брать из lscpu -e: изолировать нужно РАЗНЫЕ физические CORE."
 fi
 
 # ------------------------------------------------------------- топология
@@ -173,12 +178,21 @@ else
   if have ethtool; then
     DRV=$(ethtool -i "$IFACE" 2>/dev/null | awk '/^driver:/{print $2}')
     [ -n "$DRV" ] && ok "драйвер: $DRV" || warn "ethtool -i не отвечает — интерфейс поднят?"
-    COMBINED=$(ethtool -l "$IFACE" 2>/dev/null | awk '/^Combined:/{c=$2} END{print c}')
+    # В выводе ethtool -l первый Combined -- максимум, последний -- текущее.
+    QLINES=$(ethtool -l "$IFACE" 2>/dev/null | awk '/^Combined:/{print $2}')
+    MAXQ=$(printf '%s\n' "$QLINES" | head -1)
+    COMBINED=$(printf '%s\n' "$QLINES" | tail -1)
     if [ "${COMBINED:-1}" -gt 1 ]; then
       warn "очередей $COMBINED, а AF_XDP слушает только queue 0 — RSS раскидает поток мимо"
       hint "  sudo ethtool -L $IFACE combined 1"
     else
       ok "очередей: 1 (весь поток попадёт в queue 0)"
+    fi
+    # ENA резервирует под XDP по TX-очереди на каждую рабочую: нужно current*2 <= max.
+    if [ -n "${MAXQ:-}" ] && [ "$MAXQ" -lt 2 ]; then
+      warn "максимум очередей $MAXQ — XDP на этом интерфейсе не поднимется вовсе"
+      hint "  ENA требует 'рабочих x 2 <= максимума'; лечится инстансом побольше"
+      hint "  либо режимом А (ENA PMD), он XDP не использует — AWS.md, раздел 8"
     fi
     KOUT=$(ethtool -k "$IFACE" 2>/dev/null)
     OFFL=$(printf '%s\n' "$KOUT" | grep -E '^(generic-receive-offload|generic-segmentation-offload|tcp-segmentation-offload): on' | cut -d: -f1 | tr '\n' ' ')
