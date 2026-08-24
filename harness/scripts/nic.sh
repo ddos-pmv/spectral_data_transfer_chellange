@@ -95,8 +95,16 @@ cmd_bind() {
   else
     modprobe "$DPDK_DRIVER"
   fi
+  # devbind отказывается трогать устройство, за которым в таблице маршрутизации
+  # ещё числится маршрут ("routing table indicates that interface is active"),
+  # и делает это предупреждением, а не ошибкой -- поэтому адреса снимаем сами.
   ip link set "$DPDK_IFACE" down 2>/dev/null || true
+  ip addr flush dev "$DPDK_IFACE" 2>/dev/null || true
   dpdk-devbind.py --bind="$DPDK_DRIVER" "$pci"
+
+  # Проверяем результат: devbind мог отказаться и вернуть при этом успех.
+  drv=$(pci_driver "$pci")
+  [ "$drv" = "$DPDK_DRIVER" ] || die "привязка не удалась: $pci остался на '$drv'"
   ok "$pci -> $DPDK_DRIVER"
 }
 
@@ -108,6 +116,8 @@ cmd_unbind() {
 
   say "Возврат $pci ядру ($KERNEL_DRIVER)"
   dpdk-devbind.py --bind="$KERNEL_DRIVER" "$pci"
+  local drv; drv=$(pci_driver "$pci")
+  [ "$drv" = "$KERNEL_DRIVER" ] || die "возврат не удался: $pci остался на '$drv'"
   # Имя интерфейса и адрес возвращает netplan; без него карта поднимется без IP.
   netplan apply 2>/dev/null || true
   ip link set "$DPDK_IFACE" up 2>/dev/null || true

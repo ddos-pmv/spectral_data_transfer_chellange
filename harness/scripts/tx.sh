@@ -23,7 +23,8 @@ need_root
 [ -n "$PEER_MAC" ] || die "PEER_MAC пуст: запустите rx.sh на приёмной машине и впишите в host.conf"
 [ -n "$PEER_IP" ]  || die "PEER_IP пуст: там же"
 
-DEV=$(eal_dev)
+DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind
+   (для локального стенда на veth задайте EAL_DEV=--vdev net_af_xdp0,iface=...)"
 SRC_IP=${SRC_IP:-$(local_ip)}
 [ -n "$SRC_IP" ] || die "не определить свой IP -- задайте SRC_IP=..."
 

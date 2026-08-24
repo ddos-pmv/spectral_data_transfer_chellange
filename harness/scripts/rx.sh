@@ -20,7 +20,8 @@ BURST=${BURST:-32}
 
 need_root
 [ -x bin/dpdk_reciever ] || die "нет bin/dpdk_reciever -- make -j\$(nproc)"
-DEV=$(eal_dev)
+DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind
+   (для локального стенда на veth задайте EAL_DEV=--vdev net_af_xdp0,iface=...)"
 
 # Печатаем адреса той карты, которую слушает DPDK: в режиме PMD ядру она не
 # видна, и MAC с IP взять больше неоткуда, кроме метаданных инстанса.

@@ -99,6 +99,13 @@ resolve_pci() {
     basename "$(readlink -f "/sys/class/net/$DPDK_IFACE/device")"
     return 0
   fi
+  # Интерфейса нет -- значит карта уже у DPDK. Ищем среди устройств драйвера.
+  local d
+  for d in "/sys/bus/pci/drivers/$DPDK_DRIVER"/0000:*; do
+    [ -e "$d" ] || continue
+    basename "$d"
+    return 0
+  done
   return 1
 }
 
@@ -125,18 +132,20 @@ expand_cpus() {
 # ---------------------------------------------------------------- EAL
 # Аргумент устройства для EAL. Если карта уже у DPDK -- адресуем её по PCI,
 # иначе поднимаем AF_XDP поверх живого интерфейса (ядро видит карту, SSH цел).
+# Молчаливой подмены режима тут быть не должно: AF_XDP на ENA не поднимается
+# в принципе, и подстановка его вместо PCI даёт непонятную ошибку вместо
+# внятного "карта не привязана". Для локального стенда на veth EAL_DEV
+# задаётся явно.
 eal_dev() {
-  [ -z "${EAL_DEV:-}" ] || { echo "$EAL_DEV"; return; }
+  [ -z "${EAL_DEV:-}" ] || { echo "$EAL_DEV"; return 0; }
   local pci; pci=$(resolve_pci 2>/dev/null) || pci=""
-  if [ -n "$pci" ] && [ "$(pci_driver "$pci")" = "$DPDK_DRIVER" ]; then
-    echo "-a $pci"
-  else
-    echo "--vdev net_af_xdp0,iface=$DPDK_IFACE,start_queue=0,queue_count=1"
-  fi
+  [ -n "$pci" ] || return 1
+  [ "$(pci_driver "$pci")" = "$DPDK_DRIVER" ] || return 1
+  echo "-a $pci"
 }
 
 # В режиме AF_XDP карта видна ядру, адреса берутся через ip; в режиме PMD -- нет.
-kernel_mode() { case "$(eal_dev)" in *net_af_xdp*) return 0 ;; *) return 1 ;; esac; }
+kernel_mode() { case "${EAL_DEV:-}" in *net_af_xdp*) return 0 ;; *) return 1 ;; esac; }
 
 # IP той карты, через которую реально идёт трафик. VPC режет пакеты, у которых
 # src IP не совпадает с адресом ENI, так что брать адрес с соседней нельзя.
