@@ -80,7 +80,7 @@ row устройство "$DEV"
 row ядра "приёмник $CPU_RECEIVER, consumer $CPU_CONSUMER"
 row очередь "RX $RECEIVER_RXD дескрипторов, burst $BURST"
 row пул "$RECEIVER_MBUFS mbuf"
-row ждём "$COUNT сообщений"
+row ждём "$COUNT сообщений, прогрев $WARMUP"
 [ "$DROP_PPM" = 0 ] || row потери "$DROP_PPM ppm пачками по $BURST_LEN"
 row логи "$RUN"
 
