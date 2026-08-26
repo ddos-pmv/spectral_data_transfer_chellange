@@ -25,6 +25,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "shm_ring.h"
 
@@ -257,6 +258,77 @@ inline BringUp bring_up(const std::string& pool_name, uint32_t nb_mbufs,
 }  // namespace detail
 
 // ---------------------------------------------------------------------
+// Счётчики порта в конце прогона -- ответ на вопрос "во что упёрлись".
+//
+// ethtool на этой карте бесполезен: она отдана DPDK, ядро её не обслуживает
+// и показывает чужие или застывшие числа. Единственный живой источник --
+// xstats самого PMD. У net_ena там лежат счётчики лимитов инстанса
+// (*_allowance_exceeded): ненулевой pps_allowance_exceeded значит, что
+// упор в квоту ENI, и никакая длина очереди этого не лечит.
+//
+// Порт должен быть ещё поднят, поэтому звать нужно ДО разрушения
+// SenderPort/ReceiverPort -- их деструктор делает rte_eth_dev_stop/close.
+//
+// Печатаем только ненулевые счётчики, иначе у ENA вывод на сотню строк.
+// Исключение -- строки про allowance: там ровно ноль и есть полезный ответ,
+// поэтому они печатаются всегда, если PMD их отдаёт.
+inline void print_port_stats(uint16_t port_id) {
+  rte_eth_stats s{};
+  int ret = rte_eth_stats_get(port_id, &s);
+  if (ret == 0) {
+    std::fprintf(stderr,
+        "\n---- port %u: rte_eth_stats ----\n"
+        "opackets : %llu\n"
+        "obytes   : %llu\n"
+        "oerrors  : %llu\t(NIC отверг пакет на передаче)\n"
+        "ipackets : %llu\n"
+        "ibytes   : %llu\n"
+        "ierrors  : %llu\n"
+        "imissed  : %llu\t(не хватило RX-дескрипторов)\n"
+        "rx_nombuf: %llu\t(пул mbuf пуст на приёме)\n",
+        static_cast<unsigned>(port_id),
+        static_cast<unsigned long long>(s.opackets),
+        static_cast<unsigned long long>(s.obytes),
+        static_cast<unsigned long long>(s.oerrors),
+        static_cast<unsigned long long>(s.ipackets),
+        static_cast<unsigned long long>(s.ibytes),
+        static_cast<unsigned long long>(s.ierrors),
+        static_cast<unsigned long long>(s.imissed),
+        static_cast<unsigned long long>(s.rx_nombuf));
+  } else {
+    std::fprintf(stderr, "\nrte_eth_stats_get: %s\n", rte_strerror(-ret));
+  }
+
+  const int n = rte_eth_xstats_get_names(port_id, nullptr, 0);
+  if (n <= 0) {
+    std::fprintf(stderr, "xstats: PMD их не отдаёт (%d)\n", n);
+    return;
+  }
+  std::vector<rte_eth_xstat_name> names(static_cast<size_t>(n));
+  std::vector<rte_eth_xstat> vals(static_cast<size_t>(n));
+  if (rte_eth_xstats_get_names(port_id, names.data(), n) != n ||
+      rte_eth_xstats_get(port_id, vals.data(), n) != n) {
+    std::fprintf(stderr, "xstats: чтение не удалось\n");
+    return;
+  }
+
+  std::fprintf(stderr, "---- port %u: xstats ----\n",
+               static_cast<unsigned>(port_id));
+  unsigned shown = 0;
+  for (int i = 0; i < n; ++i) {
+    // id -- индекс в массиве имён, а не позиция в массиве значений.
+    const char* name = names[vals[i].id].name;
+    const bool allowance = std::strstr(name, "allowance") != nullptr;
+    if (vals[i].value == 0 && !allowance) continue;
+    std::fprintf(stderr, "%-40s %llu%s\n", name,
+                 static_cast<unsigned long long>(vals[i].value),
+                 allowance ? "\t(лимит ENI)" : "");
+    ++shown;
+  }
+  if (shown == 0) std::fprintf(stderr, "(все счётчики нулевые)\n");
+}
+
+// ---------------------------------------------------------------------
 // SenderPort -- TX-only DPDK port + mempool + a fixed UDP/IPv4 header
 // template (peer MAC/IP/ports are set once at construction).
 // ---------------------------------------------------------------------
@@ -277,7 +349,7 @@ class SenderPort {
         dst_port_(dst_port),
         dst_mac_(dst_mac) {
     detail::BringUp b =
-        detail::bring_up(pool_name, nb_mbufs, cache_size, /*nb_rxd=*/0,
+        detail::bring_up(pool_name, nb_mbufs, cache_size, /*nb_rxd=*/128,
                           nb_txd, /*need_rxq=*/false, /*need_txq=*/true);
 
 
@@ -289,6 +361,8 @@ class SenderPort {
   }
 
   ~SenderPort() { teardown(); }
+
+  uint16_t port_id() const { return port_id_; }
 
   SenderPort(SenderPort&& o) noexcept { *this = std::move(o); }
   SenderPort& operator=(SenderPort&& o) noexcept {
@@ -457,13 +531,15 @@ class ReceiverPort {
                uint32_t cache_size, uint16_t nb_rxd) {
     detail::BringUp b =
         detail::bring_up(pool_name, nb_mbufs, cache_size, nb_rxd,
-                          /*nb_txd=*/0, /*need_rxq=*/true, /*need_txq=*/false);
+                          /*nb_txd=*/128, /*need_rxq=*/true, /*need_txq=*/false);
     port_id_ = b.port_id;
     mempool_ = b.mempool;
     owns_port_ = true;
   }
 
   ~ReceiverPort() { teardown(); }
+
+  uint16_t port_id() const { return port_id_; }
 
   ReceiverPort(ReceiverPort&& o) noexcept { *this = std::move(o); }
   ReceiverPort& operator=(ReceiverPort&& o) noexcept {

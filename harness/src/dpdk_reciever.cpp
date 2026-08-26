@@ -164,6 +164,9 @@ int main(int argc, char** argv) {
   }
 
   const delivery::MonotonicGate::Stats& gate_stats = gate.stats();
+  // До выхода из main: деструктор порта делает dev_stop/close.
+  dpdk::print_port_stats(receiver.port_id());
+
   std::fprintf(stderr,
                "\n---- dpdk_receiver ----\n"
                "received       : %llu\t(published into the ring)\n"

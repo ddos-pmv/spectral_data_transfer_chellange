@@ -4,6 +4,8 @@
 // trade, a top-of-book (BBO) update, or a 5-level order book snapshot.
 #pragma once
 
+#include <algorithm>
+
 #include <cstdint>
 
 namespace msg {

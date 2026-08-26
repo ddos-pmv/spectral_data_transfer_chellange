@@ -164,6 +164,9 @@ int main(int argc, char** argv) {
     tx_dropped += dropped_in_burst;
   }
 
+  // До выхода из main: деструктор порта делает dev_stop/close.
+  dpdk::print_port_stats(sender.port_id());
+
   std::fprintf(stderr,
                "\n---- dpdk_sender ----\n"
                "sent       : %llu\n"
