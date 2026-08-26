@@ -13,12 +13,14 @@
 
 #include <string>
 #include <csignal>
+#include <cstddef>
 
 #include "dpdk_common.h"
 #include "message.h"
 #include "shm_ring.h"
 #include "shm_segment.h"
 #include "util.h"
+#include "delivery.h"
 
 namespace {
 
@@ -110,7 +112,10 @@ int main(int argc, char** argv) {
                cfg.udp_port, cfg.shm_name.c_str());
 
   const uint16_t want_port_be = rte_cpu_to_be_16(cfg.udp_port);
+
   Stats stats;
+  delivery::MonotonicGate gate;
+
   rte_mbuf* burst[64];
 
   while (!g_stop) {
@@ -137,9 +142,13 @@ int main(int argc, char** argv) {
                                                               &payload_len);
 
       if (status == dpdk::ReceiverPort::ParseStatus::kOk) {
-        if (payload_len > 0 && payload_len <= shm::kFrameCap) {
-          out.ring.publish(payload, payload_len);  // the one copy on this side
-          ++stats.received;
+        if (payload_len >= sizeof(msg::Header) && payload_len <= shm::kFrameCap) {
+          uint64_t seq_id = 0;
+          std::memcpy(&seq_id, payload + offsetof(msg::Header, seq_id), sizeof(seq_id));
+          if (gate.admit(seq_id)) {
+            out.ring.publish(payload, payload_len);  // the one copy on this side
+            ++stats.received;
+          }
         } else {
           ++stats.bad_len;
         }
@@ -152,19 +161,29 @@ int main(int argc, char** argv) {
     rte_pktmbuf_free_bulk(burst, n);
   }
 
+  const delivery::MonotonicGate::Stats& gate_stats = gate.stats();
   std::fprintf(stderr,
                "\n---- dpdk_receiver ----\n"
-               "received    : %llu\t(published into the ring)\n"
-               "wrong_port  : %llu\t(udp, but not our port)\n"
-               "non_udp     : %llu\t(not ipv4/udp at all)\n"
-               "bad_len     : %llu\t(our port, unusable length)\n"
-               "empty_spins : %llu\t(receiver.receive(burst, cfg.burst) returned zero)\n"
-               "avg_burst : %.2f\t(avg packets in burst)\n",
+               "received       : %llu\t(published into the ring)\n"
+               "wrong_port     : %llu\t(udp, but not our port)\n"
+               "non_udp        : %llu\t(not ipv4/udp at all)\n"
+               "bad_len        : %llu\t(our port, unusable length)\n"
+               "empty_spins    : %llu\t(receiver.receive(burst, cfg.burst) returned zero)\n"
+               "avg_burst      : %.2f\t(avg packets in burst)\n"
+               "gate_delivered : %llu\t\n"
+               "gate_suppressed: %llu\t\n"
+               "gate_gaps      : %llu\t\n"
+               "gate_missing   : %llu\t\n"
+               "injected_drops : 0\t\n",
                static_cast<unsigned long long>(stats.received),
                static_cast<unsigned long long>(stats.wrong_port),
                static_cast<unsigned long long>(stats.non_udp),
                static_cast<unsigned long long>(stats.bad_len),
                static_cast<unsigned long long>(stats.empty_spins),
-               static_cast<double>(stats.burst_pkts)/static_cast<double>(stats.bursts));
+               static_cast<double>(stats.burst_pkts)/static_cast<double>(stats.bursts),
+               static_cast<unsigned long long>(gate_stats.delivered),
+               static_cast<unsigned long long>(gate_stats.suppressed),
+               static_cast<unsigned long long>(gate_stats.gaps),
+               static_cast<unsigned long long>(gate_stats.missing));
   return 0;
 }

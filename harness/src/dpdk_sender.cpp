@@ -139,13 +139,13 @@ int main(int argc, char** argv) {
       }
       // Ring copies the frame straight into mbuf memory -- no scratch buffer.
       auto st = ring.read(read_index, sender.payload_ptr(burst[n]), &len, &resume);
-      if (st == shm::Ring::FrameStatus::kOk) [[likely]] {
+      if (st == shm::Ring::FrameStatus::kOk) {
         sender.finalize(burst[n++], static_cast<uint16_t>(len));
         ++read_index;
       } else if (st == shm::Ring::FrameStatus::kLapped) {
         ++lapped;
         read_index = resume;
-      } else [[unlikely]] {
+      } else {
         ++empty_spins;
         break;  // kEmpty: nothing new right now
       }
