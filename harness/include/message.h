@@ -40,6 +40,23 @@ struct Header {
   uint64_t send_ts_ns;      // producer send timestamp, ns since epoch
   uint32_t instrument_id;   // symbol+venue, resolved once out of band -- see body TODO
   uint32_t flags_and_type;  // see bit layout above
+
+  // Transport stamps, appended so seq_id/send_ts_ns keep their offsets (the
+  // framing contract the consumer measures on). Together with send_ts_ns (t0)
+  // and the consumer's own read (t3) they cut end-to-end latency into three
+  // segments:
+  //
+  //   A = tx_ts_ns - send_ts_ns   producer ring -> sender, incl. burst assembly
+  //   B = rx_ts_ns - tx_ts_ns     the wire: TX, network, RX
+  //   C = t3       - rx_ts_ns     receiver -> consumer ring
+  //
+  // A and C stay inside one host, so they are exact. B is the only segment
+  // that crosses the host boundary and therefore the only one carrying the
+  // two clocks' offset -- which is constant within a run, so B's *shape*
+  // (p99-p50, jitter) is still exact and only its absolute level is unknown.
+  // That is why no clock synchronisation is needed to optimise against these.
+  uint64_t tx_ts_ns;        // stamped by the sender just before the NIC
+  uint64_t rx_ts_ns;        // stamped by the receiver right after the poll
 };
 
 inline constexpr uint32_t kTypeBits = 2;

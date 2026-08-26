@@ -36,6 +36,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -201,6 +202,16 @@ int main(int argc, char** argv) {
         msgs[m].msg_len = 0;
         ++m;
       }
+    }
+
+    // t1: last thing before the syscall, same placement as the DPDK sender so
+    // segment A means the same thing on both transports.
+    const uint64_t tx_ts = util::now_ns();
+    for (uint32_t i = 0; i < got; ++i) {
+      if (iovs[i].iov_len < sizeof(msg::Header)) continue;
+      std::memcpy(static_cast<uint8_t*>(iovs[i].iov_base) +
+                      offsetof(msg::Header, tx_ts_ns),
+                  &tx_ts, sizeof(tx_ts));
     }
 
     size_t off = 0;

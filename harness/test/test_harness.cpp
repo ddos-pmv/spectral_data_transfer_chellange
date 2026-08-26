@@ -13,26 +13,36 @@
 static void test_metrics_basic() {
   metrics::Accumulator acc;
   // seq 1..100 all delivered, latency == seq nanoseconds.
-  for (uint64_t i = 1; i <= 100; ++i) acc.record(i, i);
+  // Segments are split 1:2:3 of the end-to-end value so each distribution is
+  // distinguishable and a mixed-up field shows as a failed assert.
+  for (uint64_t i = 1; i <= 100; ++i) {
+    acc.record(i, static_cast<int64_t>(6 * i), static_cast<int64_t>(i),
+               static_cast<int64_t>(2 * i), static_cast<int64_t>(3 * i));
+  }
   metrics::Report r = acc.report();
 
   assert(r.received == 100);
   assert(r.expected == 100);
   assert(r.dropped == 0);
   assert(r.drop_rate == 0.0);
-  assert(r.lat_min == 1);
-  assert(r.lat_max == 100);
+  assert(r.e2e.min == 6);
+  assert(r.e2e.max == 600);
   // Nearest-rank: p50 of 1..100 -> rank ceil(0.5*100)=50 -> value 50.
-  assert(r.p50 == 50);
-  assert(r.p99 == 99);
-  assert(r.lat_mean > 50.0 && r.lat_mean < 51.0);
+  assert(r.e2e.p50 == 300);
+  assert(r.e2e.p99 == 594);
+  // Fewer than 1e6 samples, so p99.999 can only land on the maximum.
+  assert(r.e2e.p99999 == 600);
+  assert(r.a.p50 == 50);
+  assert(r.b.p50 == 100);
+  assert(r.c.p50 == 150);
+  assert(r.a.mean > 50.0 && r.a.mean < 51.0);
   printf("test_metrics_basic OK\n");
 }
 
 static void test_metrics_drops() {
   metrics::Accumulator acc;
   // Deliver only even sequence ids 2,4,...,100 -> 50 received, 100 expected.
-  for (uint64_t i = 2; i <= 100; i += 2) acc.record(i, 10);
+  for (uint64_t i = 2; i <= 100; i += 2) acc.record(i, 10, 1, 2, 3);
   metrics::Report r = acc.report();
 
   assert(r.received == 50);
@@ -44,24 +54,25 @@ static void test_metrics_drops() {
 
 static void test_metrics_csv() {
   metrics::Accumulator acc(4);
-  acc.record(7, 111);
-  acc.record(8, 222);
+  // Negative b: the wire segment crosses hosts and legitimately comes out
+  // negative when the receiving clock runs behind. It must survive the CSV.
+  acc.record(7, 111, 1, -2, 3);
+  acc.record(8, 222, 4, 5, 6);
 
   const char* path = "/tmp/harness_metrics_test.csv";
   assert(acc.write_csv(path));
 
   FILE* f = std::fopen(path, "r");
   assert(f != nullptr);
-  char header[32] = {0};
-  uint64_t seq = 0, lat = 0;
+  char header[64] = {0};
+  unsigned long long seq = 0;
+  long long lat = 0, a = 0, b = 0, c = 0;
   assert(std::fgets(header, sizeof(header), f) != nullptr);
-  assert(std::strcmp(header, "seq,latency_ns\n") == 0);
-  assert(std::fscanf(f, "%llu,%llu", (unsigned long long*)&seq,
-                     (unsigned long long*)&lat) == 2);
-  assert(seq == 7 && lat == 111);
-  assert(std::fscanf(f, "%llu,%llu", (unsigned long long*)&seq,
-                     (unsigned long long*)&lat) == 2);
-  assert(seq == 8 && lat == 222);
+  assert(std::strcmp(header, "seq,latency_ns,a_ns,b_ns,c_ns\n") == 0);
+  assert(std::fscanf(f, "%llu,%lld,%lld,%lld,%lld", &seq, &lat, &a, &b, &c) == 5);
+  assert(seq == 7 && lat == 111 && a == 1 && b == -2 && c == 3);
+  assert(std::fscanf(f, "%llu,%lld,%lld,%lld,%lld", &seq, &lat, &a, &b, &c) == 5);
+  assert(seq == 8 && lat == 222 && a == 4 && b == 5 && c == 6);
   std::fclose(f);
   std::remove(path);
   printf("test_metrics_csv OK\n");

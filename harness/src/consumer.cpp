@@ -55,20 +55,39 @@ Config parse_args(int argc, char** argv) {
   return c;
 }
 
+// One distribution. `prefix` is empty for end-to-end so the labels stay
+// exactly what they were ("  p50        : N") and every existing log parser
+// keeps working; the segments get "a."/"b."/"c." in front.
+void print_dist(const char* prefix, const metrics::Dist& d) {
+  printf("%slatency (ns) : min=%lld mean=%.0f max=%lld\n", prefix,
+         (long long)d.min, d.mean, (long long)d.max);
+  printf("  %sp01        : %lld\n", prefix, (long long)d.p01);
+  printf("  %sp50        : %lld\n", prefix, (long long)d.p50);
+  printf("  %sp99        : %lld\n", prefix, (long long)d.p99);
+  printf("  %sp99.9      : %lld\n", prefix, (long long)d.p999);
+  printf("  %sp99.99     : %lld\n", prefix, (long long)d.p9999);
+  printf("  %sp99.999    : %lld\n", prefix, (long long)d.p99999);
+}
+
 void print_report(const metrics::Report& r) {
   printf("---- delivery metrics ----\n");
   printf("received     : %llu\n", (unsigned long long)r.received);
   printf("expected     : %llu\n", (unsigned long long)r.expected);
   printf("dropped      : %llu\n", (unsigned long long)r.dropped);
   printf("drop_rate    : %.4f%%\n", r.drop_rate * 100.0);
-  printf("latency (ns) : min=%llu mean=%.0f max=%llu\n",
-         (unsigned long long)r.lat_min, r.lat_mean,
-         (unsigned long long)r.lat_max);
-  printf("  p01        : %llu\n", (unsigned long long)r.p01);
-  printf("  p50        : %llu\n", (unsigned long long)r.p50);
-  printf("  p99        : %llu\n", (unsigned long long)r.p99);
-  printf("  p99.9      : %llu\n", (unsigned long long)r.p999);
-  printf("  p99.99     : %llu\n", (unsigned long long)r.p9999);
+  print_dist("", r.e2e);
+
+  // A and C are single-host and therefore absolute. B crosses the host
+  // boundary, so its level carries the clock offset; b_jitter below is
+  // B - min(B), which cancels that offset out and is the number to optimise.
+  printf("---- segments (ns) ----\n");
+  print_dist("a.", r.a);
+  print_dist("b.", r.b);
+  print_dist("c.", r.c);
+  printf("  b_jitter_p50   : %lld\n", (long long)(r.b.p50 - r.b.min));
+  printf("  b_jitter_p99   : %lld\n", (long long)(r.b.p99 - r.b.min));
+  printf("  b_jitter_p99.9 : %lld\n", (long long)(r.b.p999 - r.b.min));
+  printf("  b_jitter_p99.99: %lld\n", (long long)(r.b.p9999 - r.b.min));
 }
 
 }  // namespace
@@ -101,13 +120,19 @@ int main(int argc, char** argv) {
     if (st == shm::Ring::FrameStatus::kOk) {
       const uint64_t recv_ts = util::now_ns();
       const auto* hdr = reinterpret_cast<const msg::Header*>(frame);
-      const uint64_t latency =
-          recv_ts > hdr->send_ts_ns ? recv_ts - hdr->send_ts_ns : 0;
+      // Signed and unclamped on purpose: see the header note in metrics.h. A
+      // negative reading here is a clock-offset report, not a bug to hide.
+      const int64_t latency =
+          static_cast<int64_t>(recv_ts - hdr->send_ts_ns);
+      const int64_t a_ns =
+          static_cast<int64_t>(hdr->tx_ts_ns - hdr->send_ts_ns);
+      const int64_t b_ns = static_cast<int64_t>(hdr->rx_ts_ns - hdr->tx_ts_ns);
+      const int64_t c_ns = static_cast<int64_t>(recv_ts - hdr->rx_ts_ns);
       // The first `warmup` frames are timed and then thrown away: same code
       // path, so caches, branch predictors and the ring pages are warm by the
       // time the first recorded sample is taken.
       if (consumed >= cfg.warmup) {
-        acc.record(hdr->seq_id, latency);
+        acc.record(hdr->seq_id, latency, a_ns, b_ns, c_ns);
         ++received;
       }
       ++consumed;

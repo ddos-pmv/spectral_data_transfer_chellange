@@ -14,8 +14,10 @@
 #include <rte_eal.h>
 #include <rte_mbuf.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <csignal>
 
 #include <string>
@@ -157,6 +159,18 @@ int main(int argc, char** argv) {
     }
     ++bursts;
     burst_pkts += n;
+
+    // t1, stamped as late as it can be: the next statement hands these mbufs
+    // to the NIC. Writing payload after finalize() is safe -- the UDP checksum
+    // is a hardcoded zero (dpdk_common.h) and the IPv4 checksum does not cover
+    // the payload, so no header depends on these bytes. One clock read per
+    // burst, not per packet: the packets leave together.
+    const uint64_t tx_ts = util::now_ns();
+    for (uint32_t i = 0; i < n; ++i) {
+      std::memcpy(sender.payload_ptr(burst[i]) + offsetof(msg::Header, tx_ts_ns),
+                  &tx_ts, sizeof(tx_ts));
+    }
+
     uint32_t sent_in_burst = sender.send_with_retry(burst, n);
     sent_msgs += sent_in_burst;
 

@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <string>
 #include <csignal>
@@ -122,6 +123,10 @@ int main(int argc, char** argv) {
 
   while (!g_stop) {
     uint16_t n = receiver.receive(burst, cfg.burst);
+    // t2, one clock read per burst: every packet in it was already DMA'd
+    // before receive() returned, so a per-packet stamp would only be timing
+    // our own parse loop below.
+    const uint64_t rx_ts = util::now_ns();
     ++stats.bursts;
     stats.burst_pkts += n;
     if (n==0) [[unlikely]] {
@@ -148,6 +153,11 @@ int main(int argc, char** argv) {
           uint64_t seq_id = 0;
           std::memcpy(&seq_id, payload + offsetof(msg::Header, seq_id), sizeof(seq_id));
           if (gate.admit(seq_id)) {
+            // The mbuf is ours to write; stamping here rather than after the
+            // copy keeps the ring copy the only copy of the frame.
+            std::memcpy(const_cast<uint8_t*>(payload) +
+                            offsetof(msg::Header, rx_ts_ns),
+                        &rx_ts, sizeof(rx_ts));
             out.ring.publish(payload, payload_len);  // the one copy on this side
             ++stats.received;
           }

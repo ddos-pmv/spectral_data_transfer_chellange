@@ -217,11 +217,12 @@ def build(rundir, rows):
         if rs := lat.get(tag):
             out.append("<h3>латентность, нс</h3><table><tr><th>получатель</th><th>n</th>"
                        "<th>drops</th><th>p50</th><th>p99</th><th>p99.9</th>"
-                       "<th>p99.99</th></tr>")
+                       "<th>p99.99</th><th>p99.999</th></tr>")
             for r in sorted(rs, key=lambda x: x["receiver"]):
                 out.append("<tr>" + "".join(
                     f"<td>{_h(r[c])}</td>" for c in
-                    ("receiver", "n", "drop_rate", "p50", "p99", "p99.9", "p99.99")) +
+                    ("receiver", "n", "drop_rate", "p50", "p99", "p99.9", "p99.99",
+                     "p99.999")) +
                     "</tr>")
             out.append("</table>")
         roles = points[tag]

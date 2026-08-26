@@ -29,7 +29,8 @@ from profilers import expand  # noqa: E402
 HARNESS = Path(__file__).resolve().parent.parent
 SHM_TX = "/fanout_ring"
 SHM_RX = "/fanout_rx_{}"
-PCTS = {"p50": 0.50, "p99": 0.99, "p99.9": 0.999, "p99.99": 0.9999}
+PCTS = {"p50": 0.50, "p99": 0.99, "p99.9": 0.999, "p99.99": 0.9999,
+        "p99.999": 0.99999}
 SUMMARY_COLS = ["rate", "fanout", "repeat", "receiver", "n", "drop_rate",
                 *PCTS, "profiled"]
 

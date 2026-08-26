@@ -27,7 +27,7 @@ from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parent.parent
 BIN = HARNESS / "bin"
-PCTS = ["p50", "p99", "p99.9", "p99.99"]
+PCTS = ["p50", "p99", "p99.9", "p99.99", "p99.999"]
 
 
 def as_user(argv, cwd=None):
