@@ -152,6 +152,9 @@ int main(int argc, char** argv) {
         break;  // kEmpty: nothing new right now
       }
     }
+    if (n == 0) {
+      continue;
+    }
     ++bursts;
     burst_pkts += n;
     uint32_t sent_in_burst = sender.send_with_retry(burst, n);
