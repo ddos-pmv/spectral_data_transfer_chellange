@@ -43,6 +43,7 @@ struct Config {
   uint16_t burst = 32;
   uint32_t nb_mbufs = 8191;
   uint32_t cache_size = 256;
+  uint16_t txd = 2048;
 };
 
 Config parse_args(int argc, char** argv) {
@@ -66,6 +67,7 @@ Config parse_args(int argc, char** argv) {
     else if (a == "--burst") c.burst = static_cast<uint16_t>(std::stoul(next()));
     else if (a == "--mbufs") c.nb_mbufs = static_cast<uint32_t>(std::stoul(next()));
     else if (a == "--count") c.count = static_cast<uint64_t>(std::stoull(next()));
+    else if (a == "--txd") c.txd = static_cast<uint16_t>(std::stoul(next()));
     else {
       std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
       std::exit(2);
@@ -103,7 +105,7 @@ int main(int argc, char** argv) {
       }
 
   dpdk::SenderPort sender("sender_pool", cfg.nb_mbufs, cfg.cache_size,
-                           /*nb_txd=*/1024, dst_mac, src_ip_be, dst_ip_be,
+                           /*nb_txd=*/cfg.txd, dst_mac, src_ip_be, dst_ip_be,
                            cfg.src_port, cfg.dst_port);
 
   shm::Segment seg =

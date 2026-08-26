@@ -80,6 +80,47 @@ inline rte_eth_dev_info query_dev_info(uint16_t port_id) {
   return info;
 }
 
+// Печатается один раз при старте, ДО проверки дескрипторов: когда та
+// обрывает запуск, лимиты устройства уже на экране, и видно, какое число
+// вписывать в host.conf. Уходит в тот же лог, что и статистика прогона, --
+// потом не приходится гадать, на какой карте были получены числа.
+//
+// Нулевые thresh означают "PMD решает сам": tx_free_thresh -- сколько
+// отправленных дескрипторов накопится, прежде чем драйвер пойдёт их
+// освобождать, и при большой TX-очереди именно он определяет, как быстро
+// mbuf возвращаются в пул.
+inline void print_dev_info(uint16_t port_id, const rte_eth_dev_info& info) {
+  std::fprintf(stderr,
+      "---- dev_info: port %u ----\n"
+      "driver      : %s\n"
+      "queues max  : rx %u, tx %u\n"
+      "rx_desc_lim : min %u, max %u, align %u\n"
+      "tx_desc_lim : min %u, max %u, align %u, seg_max %u\n"
+      "mtu         : min %u, max %u (rx pktlen max %u)\n"
+      "tx thresh   : free %u, rs %u\n"
+      "rx thresh   : free %u\n"
+      "offload capa: rx 0x%016llx, tx 0x%016llx\n",
+      static_cast<unsigned>(port_id),
+      info.driver_name ? info.driver_name : "(unknown)",
+      static_cast<unsigned>(info.max_rx_queues),
+      static_cast<unsigned>(info.max_tx_queues),
+      static_cast<unsigned>(info.rx_desc_lim.nb_min),
+      static_cast<unsigned>(info.rx_desc_lim.nb_max),
+      static_cast<unsigned>(info.rx_desc_lim.nb_align),
+      static_cast<unsigned>(info.tx_desc_lim.nb_min),
+      static_cast<unsigned>(info.tx_desc_lim.nb_max),
+      static_cast<unsigned>(info.tx_desc_lim.nb_align),
+      static_cast<unsigned>(info.tx_desc_lim.nb_seg_max),
+      static_cast<unsigned>(info.min_mtu),
+      static_cast<unsigned>(info.max_mtu),
+      static_cast<unsigned>(info.max_rx_pktlen),
+      static_cast<unsigned>(info.default_txconf.tx_free_thresh),
+      static_cast<unsigned>(info.default_txconf.tx_rs_thresh),
+      static_cast<unsigned>(info.default_rxconf.rx_free_thresh),
+      static_cast<unsigned long long>(info.rx_offload_capa),
+      static_cast<unsigned long long>(info.tx_offload_capa));
+}
+
 inline bool supports_ip_cksum_offload(const rte_eth_dev_info& info) {
   return (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
 }
@@ -113,12 +154,26 @@ inline void configure_device(uint16_t port_id, bool need_rxq, bool need_txq,
   }
 }
 
-inline void adjust_descriptor_counts(uint16_t port_id, uint16_t* nb_rxd,
+inline void adjust_descriptor_counts_strong(uint16_t port_id, uint16_t* nb_rxd,
                                       uint16_t* nb_txd) {
+  const uint16_t wanted_txd = *nb_txd, wanted_rxd = *nb_rxd;
   int ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, nb_rxd, nb_txd);
   if (ret != 0) {
     std::fprintf(stderr, "rte_eth_dev_adjust_nb_rx_tx_desc failed: %s\n",
                  rte_strerror(-ret));
+    std::exit(1);
+  }
+
+  if (*nb_rxd != wanted_rxd) {
+    std::fprintf(stderr,
+                 "RX descriptors: requested %u, applyed %u\n",
+                 wanted_rxd, *nb_rxd);
+    std::exit(1);
+  }
+  if (*nb_txd != wanted_txd) {
+    std::fprintf(stderr,
+                 "TX descriptors: requested %u, applyed %u\n",
+                 wanted_txd, *nb_txd);
     std::exit(1);
   }
 }
@@ -178,15 +233,18 @@ inline BringUp bring_up(const std::string& pool_name, uint32_t nb_mbufs,
   b.port_id = find_first_port();
 
   const rte_eth_dev_info dev_info = query_dev_info(b.port_id);
+  print_dev_info(b.port_id, dev_info);
   b.tx_ip_cksum_offload = need_txq && supports_ip_cksum_offload(dev_info);
 
   b.mempool = create_mbuf_pool(pool_name, nb_mbufs, cache_size);
 
-  configure_device(b.port_id, /*need_rxq*/ true, /*need_txq*/ true, b.tx_ip_cksum_offload);
-  adjust_descriptor_counts(b.port_id, &nb_rxd, &nb_txd);
+  configure_device(b.port_id, /*need_rxq*/ need_rxq, /*need_txq*/ need_txq, b.tx_ip_cksum_offload);
 
-  /*if (need_rxq)*/ setup_rx_queue(b.port_id, nb_rxd, b.mempool);
-  /*if (need_txq)*/ setup_tx_queue(b.port_id, nb_txd, dev_info, b.tx_ip_cksum_offload);
+
+  adjust_descriptor_counts_strong(b.port_id, &nb_rxd, &nb_txd);
+
+  if (need_rxq) setup_rx_queue(b.port_id, nb_rxd, b.mempool);
+  if (need_txq) setup_tx_queue(b.port_id, nb_txd, dev_info, b.tx_ip_cksum_offload);
 
   start_device(b.port_id);
   b.mac = read_mac_address(b.port_id);

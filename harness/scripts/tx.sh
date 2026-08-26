@@ -6,6 +6,9 @@
 #
 #   sudo ./scripts/tx.sh
 #   sudo RATE=500000 BURST=8 ./scripts/tx.sh
+#   sudo SENDER_TXD=2048 ./scripts/tx.sh      # короче TX-очередь
+#
+# Размеры TX-очереди и пула mbuf -- SENDER_TXD/SENDER_MBUFS в host.conf.
 #
 # Адрес получателя (PEER_MAC/PEER_IP) берётся из scripts/host.conf -- его
 # печатает rx.sh на приёмной машине.
@@ -17,6 +20,15 @@ RATE=${RATE:-200000}          # msg/s, 0 = без троттлинга
 TYPE=${TYPE:-mixed}           # trade | bbo | book | mixed
 SLOTS=${SLOTS:-1024}
 BURST=${BURST:-32}
+
+# Проверяем до need_root: с опечаткой в конфиге незачем даже спрашивать пароль.
+need_uint SENDER_TXD "$SENDER_TXD" 64 4096
+need_pow2 SENDER_TXD "$SENDER_TXD"
+need_uint SENDER_MBUFS "$SENDER_MBUFS" 1024 1048576
+need_uint BURST "$BURST" 1 1024
+need_uint SLOTS "$SLOTS" 8 1048576
+need_pow2 SLOTS "$SLOTS"
+check_pool SENDER_MBUFS "$SENDER_MBUFS" SENDER_TXD "$SENDER_TXD" "$BURST"
 
 need_root
 [ -x bin/dpdk_sender ] || die "нет bin/dpdk_sender -- make -j\$(nproc)"
@@ -59,6 +71,8 @@ row "MAC получателя" "$PEER_MAC"
 row устройство "$DEV"
 row ядра "producer $CPU_PRODUCER, отправитель $CPU_SENDER"
 row темп "$RATE msg/s, тип $TYPE"
+row очередь "TX $SENDER_TXD дескрипторов, burst $BURST"
+row пул "$SENDER_MBUFS mbuf"
 row логи "$RUN"
 
 taskset -c "$CPU_PRODUCER" setarch -R ./bin/producer \
@@ -79,6 +93,7 @@ taskset -c "$CPU_SENDER" setarch -R ./bin/dpdk_sender \
   -- --shm /fanout_ring --slots "$SLOTS" \
      --dst-mac "$PEER_MAC" --src-ip "$SRC_IP" --dst-ip "$PEER_IP" \
      --dst-port "$PORT" --burst "$BURST" \
+     --mbufs "$SENDER_MBUFS" --txd "$SENDER_TXD" \
   > "$RUN/sender.log" 2>&1 &
 SENDER=$!
 

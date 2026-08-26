@@ -34,6 +34,7 @@ struct Config {
   uint16_t burst = 32;
   uint32_t nb_mbufs = 8191;
   uint32_t cache_size = 256;
+  uint16_t rxd = 2048;
 };
 
 Config parse_args(int argc, char** argv) {
@@ -52,6 +53,7 @@ Config parse_args(int argc, char** argv) {
     else if (a == "--port") c.udp_port = static_cast<uint16_t>(std::stoul(next()));
     else if (a == "--burst") c.burst = static_cast<uint16_t>(std::stoul(next()));
     else if (a == "--mbufs") c.nb_mbufs = static_cast<uint32_t>(std::stoul(next()));
+    else if (a == "--rxd") c.rxd = static_cast<uint32_t>(std::stoul(next()));
     else {
       std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
       std::exit(2);
@@ -104,7 +106,7 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, on_signal);
 
   dpdk::ReceiverPort receiver("receiver_pool", cfg.nb_mbufs, cfg.cache_size,
-                               /*nb_rxd=*/1024);
+                               /*nb_rxd=*/cfg.rxd);
 
   RingHandle out = create_output_ring(cfg.shm_name, cfg.slots);
 
