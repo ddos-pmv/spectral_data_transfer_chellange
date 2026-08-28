@@ -85,8 +85,10 @@ struct BringUp {
   rte_mempool* mempool;
   rte_ether_addr mac;
   bool tx_ip_cksum_offload;
+  uint16_t nb_rxq;          // RX queues actually created
   uint16_t nb_txq;          // TX queues actually created
-  uint16_t max_tx_queues;   // what the device would have allowed
+  uint16_t max_rx_queues;   // what the device would have allowed
+  uint16_t max_tx_queues;
 };
 
 inline uint16_t find_first_port() {
@@ -180,9 +182,21 @@ inline void configure_device(uint16_t port_id, uint16_t nb_rxq, uint16_t nb_txq,
   }
 }
 
+// Checks the descriptor counts the caller asked for against the device, and
+// refuses to run on a mismatch rather than quietly using a different number --
+// ring depth changes the tail, so it must not be substituted behind our back.
+//
+// A null pointer means "this direction has no queues": rte_eth_dev_adjust_nb_
+// rx_tx_desc accepts NULL and skips that side, so a TX-only port is not
+// measured against an RX limit it will never touch. That is not cosmetic. The
+// call clamps whatever it is given up to the device minimum, so a sender
+// passing a placeholder RX count would abort here over descriptors it never
+// allocates, on a card whose rx_desc_lim.nb_min happens to exceed the
+// placeholder.
 inline void adjust_descriptor_counts_strong(uint16_t port_id, uint16_t* nb_rxd,
                                       uint16_t* nb_txd) {
-  const uint16_t wanted_txd = *nb_txd, wanted_rxd = *nb_rxd;
+  const uint16_t wanted_rxd = nb_rxd ? *nb_rxd : 0;
+  const uint16_t wanted_txd = nb_txd ? *nb_txd : 0;
   int ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, nb_rxd, nb_txd);
   if (ret != 0) {
     std::fprintf(stderr, "rte_eth_dev_adjust_nb_rx_tx_desc failed: %s\n",
@@ -190,13 +204,13 @@ inline void adjust_descriptor_counts_strong(uint16_t port_id, uint16_t* nb_rxd,
     std::exit(1);
   }
 
-  if (*nb_rxd != wanted_rxd) {
+  if (nb_rxd && *nb_rxd != wanted_rxd) {
     std::fprintf(stderr,
-                 "RX descriptors: requested %u, applyed %u\n",
+                 "RX descriptors: requested %u, device allows %u\n",
                  wanted_rxd, *nb_rxd);
     std::exit(1);
   }
-  if (*nb_txd != wanted_txd) {
+  if (nb_txd && *nb_txd != wanted_txd) {
     // On ENA this almost always means large LLQ (llq_policy=3): 256-byte queue
     // entries in the same device memory halve how many of them fit, so the TX
     // ring maximum drops. That trade is worth taking -- inline packets are why
@@ -211,13 +225,13 @@ inline void adjust_descriptor_counts_strong(uint16_t port_id, uint16_t* nb_rxd,
   }
 }
 
-inline void setup_rx_queue(uint16_t port_id, uint16_t nb_rxd,
+inline void setup_rx_queue(uint16_t port_id, uint16_t queue_id, uint16_t nb_rxd,
                             rte_mempool* pool) {
-  int ret = rte_eth_rx_queue_setup(port_id, 0, nb_rxd, rte_socket_id(),
+  int ret = rte_eth_rx_queue_setup(port_id, queue_id, nb_rxd, rte_socket_id(),
                                     nullptr, pool);
   if (ret != 0) {
-    std::fprintf(stderr, "rte_eth_rx_queue_setup failed: %s\n",
-                 rte_strerror(-ret));
+    std::fprintf(stderr, "rte_eth_rx_queue_setup(q=%u) failed: %s\n",
+                 static_cast<unsigned>(queue_id), rte_strerror(-ret));
     std::exit(1);
   }
 }
@@ -259,41 +273,67 @@ inline rte_ether_addr read_mac_address(uint16_t port_id) {
 // Same sequence for both port classes -- this is the checklist, each step
 // is one named function above. Order matters: mempool before configure,
 // configure before queue setup, queue setup before start.
-// `wanted_txq` is how many TX queues the caller would like -- one per receiver,
-// for the sender. It is clamped to what the device offers rather than being an
-// error, because that number is a property of the instance and not of the
-// configuration: an ENA .large gives one queue, a bigger instance gives several.
-// The same binary has to run on whatever size the run lands on, so the sender
-// adapts by sharing queues between destinations instead of refusing to start.
-// The clamp is reported so it is never silent.
+// How many queues we actually get. Clamped to what the device offers rather
+// than treated as an error, because that number is a property of the instance
+// and not of the configuration: an ENA .large gives one TX queue, a bigger
+// instance gives several. The same binary has to run on whatever size the run
+// lands on, so the caller adapts (the sender shares queues between
+// destinations) instead of refusing to start. Never silent.
+inline uint16_t clamp_queues(const char* dir, uint16_t wanted, uint16_t avail) {
+  if (wanted <= avail) return wanted;
+  std::fprintf(stderr,
+               "dpdk: asked for %u %s queues, device allows %u -- sharing\n",
+               static_cast<unsigned>(wanted), dir,
+               static_cast<unsigned>(avail));
+  return avail;
+}
+
+// Brings the port up. Each direction is described by a pair -- how many queues,
+// and how deep each one is -- and a queue count of zero means the port does not
+// do that direction at all: no descriptors are requested for it, no limit of
+// the device is checked against it, and no queue is created.
+//
+// That is why the counts are parameters rather than the booleans they used to
+// be. A TX-only sender previously still had to name an RX descriptor count it
+// would never allocate, which was not merely noise: the strict descriptor check
+// compared that placeholder against the card's RX minimum and could abort the
+// sender over a ring it does not have.
+//
+// Order matters and is the checklist below: mempool before configure, configure
+// before queue setup, queue setup before start.
 inline BringUp bring_up(const std::string& pool_name, uint32_t nb_mbufs,
-                         uint32_t cache_size, uint16_t nb_rxd, uint16_t nb_txd,
-                         bool need_rxq, uint16_t wanted_nb_txq) {
+                         uint32_t cache_size,
+                         uint16_t wanted_rxq, uint16_t nb_rxd,
+                         uint16_t wanted_txq, uint16_t nb_txd) {
   BringUp b{};
   b.port_id = find_first_port();
 
   const rte_eth_dev_info dev_info = query_dev_info(b.port_id);
   print_dev_info(b.port_id, dev_info);
 
+  b.max_rx_queues = dev_info.max_rx_queues;
   b.max_tx_queues = dev_info.max_tx_queues;
-  b.nb_txq = std::min(wanted_nb_txq, dev_info.max_tx_queues);
-  if (b.nb_txq < wanted_nb_txq) {
-    std::fprintf(stderr,
-                 "dpdk: asked for %u TX queues, device allows %u -- "
-                 "destinations will share queues\n",
-                 static_cast<unsigned>(wanted_nb_txq),
-                 static_cast<unsigned>(b.nb_txq));
+  b.nb_rxq = wanted_rxq ? clamp_queues("RX", wanted_rxq, b.max_rx_queues) : 0;
+  b.nb_txq = wanted_txq ? clamp_queues("TX", wanted_txq, b.max_tx_queues) : 0;
+
+  if (b.nb_rxq == 0 && b.nb_txq == 0) {
+    std::fprintf(stderr, "dpdk: a port with neither RX nor TX queues\n");
+    std::exit(1);
   }
 
-  b.tx_ip_cksum_offload = (wanted_nb_txq >  0) && supports_ip_cksum_offload(dev_info);
+  b.tx_ip_cksum_offload = b.nb_txq != 0 && supports_ip_cksum_offload(dev_info);
 
   b.mempool = create_mbuf_pool(pool_name, nb_mbufs, cache_size);
 
-  configure_device(b.port_id, need_rxq, b.nb_txq, b.tx_ip_cksum_offload);
+  configure_device(b.port_id, b.nb_rxq, b.nb_txq, b.tx_ip_cksum_offload);
 
-  adjust_descriptor_counts_strong(b.port_id, &nb_rxd, &nb_txd);
+  // Null for a direction we do not use -- see adjust_descriptor_counts_strong.
+  adjust_descriptor_counts_strong(b.port_id, b.nb_rxq ? &nb_rxd : nullptr,
+                                   b.nb_txq ? &nb_txd : nullptr);
 
-  if (need_rxq) setup_rx_queue(b.port_id, nb_rxd, b.mempool);
+  for (uint16_t q = 0; q < b.nb_rxq; ++q) {
+    setup_rx_queue(b.port_id, q, nb_rxd, b.mempool);
+  }
   for (uint16_t q = 0; q < b.nb_txq; ++q) {
     setup_tx_queue(b.port_id, q, nb_txd, dev_info, b.tx_ip_cksum_offload);
   }
@@ -301,8 +341,10 @@ inline BringUp bring_up(const std::string& pool_name, uint32_t nb_mbufs,
   start_device(b.port_id);
   b.mac = read_mac_address(b.port_id);
 
-  std::fprintf(stderr, "dpdk: port %u up (ip_cksum_hw=%d, tx_queues=%u)\n",
+  std::fprintf(stderr,
+               "dpdk: port %u up (ip_cksum_hw=%d, rx_queues=%u, tx_queues=%u)\n",
                b.port_id, b.tx_ip_cksum_offload,
+               static_cast<unsigned>(b.nb_rxq),
                static_cast<unsigned>(b.nb_txq));
   return b;
 }
@@ -432,9 +474,12 @@ class SenderPort {
     uint16_t wanted_txq = static_cast<uint16_t>(dests.size());
     if (queue_cap != 0 && queue_cap < wanted_txq) wanted_txq = queue_cap;
 
-    detail::BringUp b = detail::bring_up(
-        pool_name, nb_mbufs, cache_size, /*nb_rxd=*/0, nb_txd,
-        /*need_rxq=*/false, wanted_txq);
+    // TX only: the sender never receives, so it asks for no RX queues and
+    // names no RX descriptor count.
+    detail::BringUp b =
+        detail::bring_up(pool_name, nb_mbufs, cache_size,
+                          /*wanted_rxq=*/0, /*nb_rxd=*/0,
+                          /*wanted_txq=*/wanted_txq, /*nb_txd=*/nb_txd);
 
     port_id_ = b.port_id;
     mempool_ = b.mempool;
@@ -700,9 +745,12 @@ class ReceiverPort {
 
   ReceiverPort(const std::string& pool_name, uint32_t nb_mbufs,
                uint32_t cache_size, uint16_t nb_rxd) {
+    // RX only: the receiver never transmits, so it asks for no TX queues and
+    // names no TX descriptor count.
     detail::BringUp b =
-        detail::bring_up(pool_name, nb_mbufs, cache_size, nb_rxd,
-                          /*nb_txd=*/128, /*need_rxq=*/true, /*wanted_txq=*/0);
+        detail::bring_up(pool_name, nb_mbufs, cache_size,
+                          /*wanted_rxq=*/1, /*nb_rxd=*/nb_rxd,
+                          /*wanted_txq=*/0, /*nb_txd=*/0);
     port_id_ = b.port_id;
     mempool_ = b.mempool;
     owns_port_ = true;
