@@ -10,8 +10,8 @@
 #
 # Размеры TX-очереди и пула mbuf -- SENDER_TXD/SENDER_MBUFS в host.conf.
 #
-# Адрес получателя (PEER_MAC/PEER_IP) берётся из scripts/host.conf -- его
-# печатает rx.sh на приёмной машине.
+# Получатели берутся из scripts/host.conf: PEERS="MAC@IP:PORT ..." для веера,
+# или пара PEER_MAC/PEER_IP для одного -- её печатает rx.sh на приёмной машине.
 set -euo pipefail
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
 cd "$ROOT_DIR"
@@ -28,15 +28,33 @@ need_uint SENDER_MBUFS "$SENDER_MBUFS" 1024 1048576
 need_uint BURST "$BURST" 1 1024
 need_uint SLOTS "$SLOTS" 8 1048576
 need_pow2 SLOTS "$SLOTS"
-check_pool SENDER_MBUFS "$SENDER_MBUFS" SENDER_TXD "$SENDER_TXD" "$BURST"
+
+# Получатели. Форма адресации ровно одна -- список MAC@IP:PORT; пара
+# PEER_MAC/PEER_IP сворачивается в него здесь же. Дальше ни скрипт, ни сам
+# отправитель не знают, что "один получатель" бывает особым случаем.
+if [ -z "${PEERS:-}" ]; then
+  [ -n "${PEER_MAC:-}" ] || die "получатели не заданы: впишите в host.conf PEER_MAC/PEER_IP
+   (их печатает rx.sh на приёмной машине) или PEERS=\"MAC@IP:PORT ...\" для нескольких"
+  [ -n "${PEER_IP:-}" ]  || die "PEER_IP пуст: там же"
+  PEERS="$PEER_MAC@$PEER_IP:$PORT"
+fi
+
+# Массив, а не строка: MAC-адреса не должны разъехаться при словоделении.
+DEST_ARGS=()
+for peer in $PEERS; do
+  case "$peer" in
+    *@*:*) DEST_ARGS+=(--dest "$peer") ;;
+    *) die "получатель '$peer' не в формате MAC@IP:PORT" ;;
+  esac
+done
+NDEST=$(( ${#DEST_ARGS[@]} / 2 ))
+
+check_pool SENDER_MBUFS "$SENDER_MBUFS" SENDER_TXD "$SENDER_TXD" "$BURST" "$NDEST"
 
 need_root
 [ -x bin/dpdk_sender ] || die "нет bin/dpdk_sender -- make -j\$(nproc)"
-[ -n "$PEER_MAC" ] || die "PEER_MAC пуст: запустите rx.sh на приёмной машине и впишите в host.conf"
-[ -n "$PEER_IP" ]  || die "PEER_IP пуст: там же"
 
-DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind
-   (для локального стенда на veth задайте EAL_DEV=--vdev net_af_xdp0,iface=...)"
+DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind"
 SRC_IP=${SRC_IP:-$(local_ip)}
 [ -n "$SRC_IP" ] || die "не определить свой IP -- задайте SRC_IP=..."
 
@@ -61,13 +79,14 @@ cleanup() {
   [ -n "${SUDO_UID:-}" ] && chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$RUN" || true
   echo
   echo "статистика отправителя: $RUN/sender.log"
-  tail -n 9 "$RUN/sender.log" 2>/dev/null || true
+  tail -n 20 "$RUN/sender.log" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 say "Отправка"
-row маршрут "$SRC_IP -> $PEER_IP:$PORT"
-row "MAC получателя" "$PEER_MAC"
+row отправитель "$SRC_IP"
+row получатели "$NDEST"
+for peer in $PEERS; do row "  ->" "$peer"; done
 row устройство "$DEV"
 row ядра "producer $CPU_PRODUCER, отправитель $CPU_SENDER"
 row темп "$RATE msg/s, тип $TYPE"
@@ -91,8 +110,7 @@ taskset -c "$CPU_SENDER" setarch -R ./bin/dpdk_sender \
   -l "$CPU_SENDER" --file-prefix tx \
   $DEV \
   -- --shm /fanout_ring --slots "$SLOTS" \
-     --dst-mac "$PEER_MAC" --src-ip "$SRC_IP" --dst-ip "$PEER_IP" \
-     --dst-port "$PORT" --burst "$BURST" \
+     --src-ip "$SRC_IP" "${DEST_ARGS[@]}" --burst "$BURST" \
      --mbufs "$SENDER_MBUFS" --txd "$SENDER_TXD" \
   > "$RUN/sender.log" 2>&1 &
 SENDER=$!

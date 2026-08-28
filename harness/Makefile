@@ -1,7 +1,7 @@
 # Standalone build for the fan-out benchmark harness. No external dependencies
 # beyond a C++17 compiler and librt (POSIX shared memory).
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -O3 -g -fno-omit-frame-pointer -Wall -Wextra -Iinclude
+CXXFLAGS ?= -std=c++17 -O3 -march=native -g -fno-omit-frame-pointer -Wall -Wextra -Iinclude
 LDLIBS   ?= -lrt -lpthread
 
 BIN := bin

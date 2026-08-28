@@ -33,7 +33,7 @@ else
   cd dpdk-stable
   git fetch --quiet --tags
   git checkout --quiet "$DPDK_VER"
-  # Драйверы (net_ena, net_af_xdp) собираются отдельными .so и подгружаются
+  # Драйвер net_ena собирается отдельным .so и подгружается
   # EAL в рантайме -- поэтому важна и сборка, и ldconfig ниже.
   meson setup build --prefix=/usr/local -Dplatform=native -Dbuildtype=release
   ninja -C build
@@ -45,8 +45,8 @@ echo "$LIBDIR" > /etc/ld.so.conf.d/dpdk.conf
 ldconfig
 PMDS=$(find "$LIBDIR" -maxdepth 2 -type d -name 'pmds-*' | head -1)
 row "драйверы" "$PMDS"
-ls "$PMDS" | grep -E 'net_(ena|af_xdp)\.so$' | sed 's/^/   /' \
-  || die "нет net_ena/net_af_xdp -- без них порт не поднимется"
+ls "$PMDS" | grep -E 'net_ena\.so$' | sed 's/^/   /' \
+  || die "нет net_ena -- без него порт не поднимется"
 
 if [ "$WITH_IGB_UIO" = 1 ]; then
   say "igb_uio с Write Combining"

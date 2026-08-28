@@ -36,16 +36,12 @@ check_pool RECEIVER_MBUFS "$RECEIVER_MBUFS" RECEIVER_RXD "$RECEIVER_RXD" "$BURST
 
 need_root
 [ -x bin/dpdk_reciever ] || die "нет bin/dpdk_reciever -- make -j\$(nproc)"
-DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind
-   (для локального стенда на veth задайте EAL_DEV=--vdev net_af_xdp0,iface=...)"
+DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind"
 
-# Печатаем адреса той карты, которую слушает DPDK: в режиме PMD ядру она не
-# видна, и MAC с IP взять больше неоткуда, кроме метаданных инстанса.
+# Печатаем адреса той карты, которую слушает DPDK: ядру она не видна, и MAC с
+# IP взять больше неоткуда, кроме метаданных инстанса.
 say "Вписать в host.conf отправляющей машины"
-if kernel_mode; then
-  row PEER_MAC "$(cat "/sys/class/net/$DPDK_IFACE/address")"
-  row PEER_IP "$(local_ip)"
-elif ADDRS=$(eni_addrs "$DPDK_ENI_INDEX"); then
+if ADDRS=$(eni_addrs "$DPDK_ENI_INDEX"); then
   row PEER_MAC "$(awk '{print $1}' <<<"$ADDRS")"
   row PEER_IP "$(awk '{print $2}' <<<"$ADDRS")"
 else

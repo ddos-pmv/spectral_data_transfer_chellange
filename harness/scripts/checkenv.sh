@@ -47,7 +47,7 @@ else
 fi
 PMDS=$(find /usr/local/lib/x86_64-linux-gnu -maxdepth 2 -type d -name 'pmds-*' 2>/dev/null | head -1)
 if [ -n "$PMDS" ]; then
-  for d in net_ena net_af_xdp; do
+  for d in net_ena; do
     [ -e "$PMDS/librte_$d.so" ] && ok "$d" || warn "$d не собран"
   done
 else

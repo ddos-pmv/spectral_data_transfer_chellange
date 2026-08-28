@@ -1,14 +1,17 @@
 // dpdk_port.h
 //
 // OOP wrapper around the DPDK port lifecycle for the sender/receiver pair.
-// SenderPort owns a TX-only queue, ReceiverPort an RX-only queue; both share
-// the same bring-up sequence (mempool -> configure -> queue setup -> start)
-// through a private helper so it's written once, not duplicated per class.
+// SenderPort owns TX queues -- one per receiver where the device allows it --
+// and ReceiverPort an RX-only queue; both share the same bring-up sequence
+// (mempool -> configure -> queue setup -> start) through a private helper so
+// it's written once, not duplicated per class.
 //
 // SenderPort::payload_ptr()/finalize() are split on purpose: the caller
 // (dpdk_sender.cpp) reads the shm-ring frame directly into mbuf memory at
 // payload_ptr(), so there is exactly one copy from the ring to the wire --
 // not a copy into a scratch buffer followed by a second copy into the mbuf.
+// With several receivers that first copy is still made once; the other
+// receivers' packets are filled from it via replicate().
 #pragma once
 
 #include <rte_eal.h>
@@ -20,10 +23,12 @@
 
 #include <netinet/in.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -54,6 +59,25 @@ inline bool parse_ipv4(const std::string& s, uint32_t* out_be) {
   return true;
 }
 
+// One receiver: where its packets are addressed. The sender holds a table of
+// these -- fan-out is "the table has more than one row", not a separate code
+// path. A multicast group is expressible as a single row (group MAC + 239/8
+// address) on a fabric that replicates; on a VPC, which does not, the table
+// simply carries one row per receiver and the sender replicates itself.
+struct DestSpec {
+  rte_ether_addr mac{};
+  uint32_t ip_be = 0;
+  uint16_t port = 0;
+};
+
+// 12 bytes of plain data. Worth asserting rather than assuming, because the
+// whole sender passes these around by value -- into the vector, into
+// SenderPort's table -- on the understanding that a copy is all there is. Any
+// future member that owns something would silently make those copies expensive
+// and would make std::move on a DestSpec suddenly mean something.
+static_assert(std::is_trivially_copyable_v<DestSpec>,
+              "DestSpec is stored and passed by value; keep it a POD");
+
 namespace detail {
 
 struct BringUp {
@@ -61,6 +85,8 @@ struct BringUp {
   rte_mempool* mempool;
   rte_ether_addr mac;
   bool tx_ip_cksum_offload;
+  uint16_t nb_txq;          // TX queues actually created
+  uint16_t max_tx_queues;   // what the device would have allowed
 };
 
 inline uint16_t find_first_port() {
@@ -140,14 +166,13 @@ inline rte_mempool* create_mbuf_pool(const std::string& name,
   return pool;
 }
 
-inline void configure_device(uint16_t port_id, bool need_rxq, bool need_txq,
+inline void configure_device(uint16_t port_id, uint16_t nb_rxq, uint16_t nb_txq,
                               bool ip_cksum_offload) {
   rte_eth_conf eth_conf{};
   if (ip_cksum_offload) {
     eth_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
   }
-  int ret = rte_eth_dev_configure(port_id, need_rxq ? 1 : 0, need_txq ? 1 : 0,
-                                   &eth_conf);
+  int ret = rte_eth_dev_configure(port_id, nb_rxq, nb_txq, &eth_conf);
   if (ret != 0) {
     std::fprintf(stderr, "rte_eth_dev_configure failed: %s\n",
                  rte_strerror(-ret));
@@ -172,9 +197,16 @@ inline void adjust_descriptor_counts_strong(uint16_t port_id, uint16_t* nb_rxd,
     std::exit(1);
   }
   if (*nb_txd != wanted_txd) {
+    // On ENA this almost always means large LLQ (llq_policy=3): 256-byte queue
+    // entries in the same device memory halve how many of them fit, so the TX
+    // ring maximum drops. That trade is worth taking -- inline packets are why
+    // the tail is low -- so the fix is to lower --txd to the number printed
+    // here, not to turn large LLQ off.
     std::fprintf(stderr,
-                 "TX descriptors: requested %u, applyed %u\n",
-                 wanted_txd, *nb_txd);
+                 "TX descriptors: requested %u, device allows %u\n"
+                 "  (on ENA with llq_policy=3 the TX ring is half depth; "
+                 "set --txd / SENDER_TXD to %u)\n",
+                 wanted_txd, *nb_txd, *nb_txd);
     std::exit(1);
   }
 }
@@ -190,16 +222,16 @@ inline void setup_rx_queue(uint16_t port_id, uint16_t nb_rxd,
   }
 }
 
-inline void setup_tx_queue(uint16_t port_id, uint16_t nb_txd,
+inline void setup_tx_queue(uint16_t port_id, uint16_t queue_id, uint16_t nb_txd,
                             const rte_eth_dev_info& dev_info,
                             bool ip_cksum_offload) {
   rte_eth_txconf txconf = dev_info.default_txconf;
   txconf.offloads = ip_cksum_offload ? RTE_ETH_TX_OFFLOAD_IPV4_CKSUM : 0;
-  int ret =
-      rte_eth_tx_queue_setup(port_id, 0, nb_txd, rte_socket_id(), &txconf);
+  int ret = rte_eth_tx_queue_setup(port_id, queue_id, nb_txd, rte_socket_id(),
+                                    &txconf);
   if (ret != 0) {
-    std::fprintf(stderr, "rte_eth_tx_queue_setup failed: %s\n",
-                 rte_strerror(-ret));
+    std::fprintf(stderr, "rte_eth_tx_queue_setup(q=%u) failed: %s\n",
+                 static_cast<unsigned>(queue_id), rte_strerror(-ret));
     std::exit(1);
   }
 }
@@ -227,31 +259,51 @@ inline rte_ether_addr read_mac_address(uint16_t port_id) {
 // Same sequence for both port classes -- this is the checklist, each step
 // is one named function above. Order matters: mempool before configure,
 // configure before queue setup, queue setup before start.
+// `wanted_txq` is how many TX queues the caller would like -- one per receiver,
+// for the sender. It is clamped to what the device offers rather than being an
+// error, because that number is a property of the instance and not of the
+// configuration: an ENA .large gives one queue, a bigger instance gives several.
+// The same binary has to run on whatever size the run lands on, so the sender
+// adapts by sharing queues between destinations instead of refusing to start.
+// The clamp is reported so it is never silent.
 inline BringUp bring_up(const std::string& pool_name, uint32_t nb_mbufs,
                          uint32_t cache_size, uint16_t nb_rxd, uint16_t nb_txd,
-                         bool need_rxq [[maybe_unused]], bool need_txq [[maybe_unused]]) {
+                         bool need_rxq, uint16_t wanted_nb_txq) {
   BringUp b{};
   b.port_id = find_first_port();
 
   const rte_eth_dev_info dev_info = query_dev_info(b.port_id);
   print_dev_info(b.port_id, dev_info);
-  b.tx_ip_cksum_offload = need_txq && supports_ip_cksum_offload(dev_info);
+
+  b.max_tx_queues = dev_info.max_tx_queues;
+  b.nb_txq = std::min(wanted_nb_txq, dev_info.max_tx_queues);
+  if (b.nb_txq < wanted_nb_txq) {
+    std::fprintf(stderr,
+                 "dpdk: asked for %u TX queues, device allows %u -- "
+                 "destinations will share queues\n",
+                 static_cast<unsigned>(wanted_nb_txq),
+                 static_cast<unsigned>(b.nb_txq));
+  }
+
+  b.tx_ip_cksum_offload = (wanted_nb_txq >  0) && supports_ip_cksum_offload(dev_info);
 
   b.mempool = create_mbuf_pool(pool_name, nb_mbufs, cache_size);
 
-  configure_device(b.port_id, /*need_rxq*/ need_rxq, /*need_txq*/ need_txq, b.tx_ip_cksum_offload);
-
+  configure_device(b.port_id, need_rxq, b.nb_txq, b.tx_ip_cksum_offload);
 
   adjust_descriptor_counts_strong(b.port_id, &nb_rxd, &nb_txd);
 
   if (need_rxq) setup_rx_queue(b.port_id, nb_rxd, b.mempool);
-  if (need_txq) setup_tx_queue(b.port_id, nb_txd, dev_info, b.tx_ip_cksum_offload);
+  for (uint16_t q = 0; q < b.nb_txq; ++q) {
+    setup_tx_queue(b.port_id, q, nb_txd, dev_info, b.tx_ip_cksum_offload);
+  }
 
   start_device(b.port_id);
   b.mac = read_mac_address(b.port_id);
 
-  std::fprintf(stderr, "dpdk: port %u up (ip_cksum_hw=%d)\n", b.port_id,
-               b.tx_ip_cksum_offload);
+  std::fprintf(stderr, "dpdk: port %u up (ip_cksum_hw=%d, tx_queues=%u)\n",
+               b.port_id, b.tx_ip_cksum_offload,
+               static_cast<unsigned>(b.nb_txq));
   return b;
 }
 
@@ -299,6 +351,10 @@ inline void print_port_stats(uint16_t port_id) {
     std::fprintf(stderr, "\nrte_eth_stats_get: %s\n", rte_strerror(-ret));
   }
 
+  // Per-queue TX counters are not in rte_eth_stats any more (DPDK dropped the
+  // q_* arrays in favour of xstats), so "did each queue actually carry traffic"
+  // is answered by the tx_q<N>_packets rows the loop below prints, and by the
+  // sender's own per-destination accounting at exit.
   const int n = rte_eth_xstats_get_names(port_id, nullptr, 0);
   if (n <= 0) {
     std::fprintf(stderr, "xstats: PMD их не отдаёт (%d)\n", n);
@@ -329,69 +385,90 @@ inline void print_port_stats(uint16_t port_id) {
 }
 
 // ---------------------------------------------------------------------
-// SenderPort -- TX-only DPDK port + mempool + a fixed UDP/IPv4 header
-// template (peer MAC/IP/ports are set once at construction).
+// SenderPort -- TX-only DPDK port + mempool + a table of destinations.
+//
+// Fan-out lives here rather than in the caller, because the only thing that
+// differs between receivers is the 42 bytes of Ethernet/IPv4/UDP in front of an
+// otherwise identical payload. Each destination therefore owns a prebuilt
+// header template, and replicating a frame is: copy the template, patch the
+// three length/checksum fields that depend on this particular payload, copy the
+// payload. No mbuf cloning -- see the note on replicate() for why.
+//
+// Each destination is also assigned a TX queue (`d % n_queues`). When the device
+// offers at least one queue per receiver, that is a queue each, and the ordering
+// between receivers becomes a hardware arbitration property rather than a
+// consequence of the order we happened to enqueue in. When it offers fewer (a
+// smaller instance size offers fewer), destinations share, and the caller is
+// expected to interleave by message so no receiver sits behind another's whole
+// burst. ENA advertises its queue count per instance size -- `ethtool -l`,
+// "Combined" under Pre-set maximums -- so this is read off the machine, not
+// configured.
 // ---------------------------------------------------------------------
 class SenderPort {
  public:
   static constexpr uint16_t kHeaderLen = static_cast<uint16_t>(
       sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr) + sizeof(rte_udp_hdr));
 
-  static_assert(kHeaderLen + shm::kFrameCap <= RTE_MBUF_DEFAULT_DATAROOM, "frame + L2/L3/L4 headers must fit on mbuf");
+  static constexpr uint32_t kMaxDests = 16;
 
+  static_assert(kHeaderLen + shm::kFrameCap <= RTE_MBUF_DEFAULT_DATAROOM, "frame + L2/L3/L4 headers must fit on mbuf");
+  static_assert(kHeaderLen + shm::kFrameCap <= 224, "packet must fit ENA large-LLQ inline entry");
+
+  // `queue_cap` of 0 means "one queue per destination, as many as the device
+  // allows" -- the default. A non-zero value caps it, which is what makes the
+  // queue count a measurable variable rather than an assumption: the same run
+  // can be repeated with every destination sharing one queue.
   SenderPort(const std::string& pool_name, uint32_t nb_mbufs,
              uint32_t cache_size, uint16_t nb_txd,
-             const rte_ether_addr& dst_mac, uint32_t src_ip_be,
-             uint32_t dst_ip_be, uint16_t src_port, uint16_t dst_port)
-      : src_ip_be_(src_ip_be),
-        dst_ip_be_(dst_ip_be),
-        src_port_(src_port),
-        dst_port_(dst_port),
-        dst_mac_(dst_mac) {
-    detail::BringUp b =
-        detail::bring_up(pool_name, nb_mbufs, cache_size, /*nb_rxd=*/128,
-                          nb_txd, /*need_rxq=*/false, /*need_txq=*/true);
+             const std::vector<DestSpec>& dests, uint32_t src_ip_be,
+             uint16_t src_port, uint16_t queue_cap = 0)
+      : src_ip_be_(src_ip_be), src_port_(src_port) {
+    if (dests.empty() || dests.size() > kMaxDests) {
+      std::fprintf(stderr, "SenderPort: need 1..%u destinations, got %zu\n",
+                   kMaxDests, dests.size());
+      std::exit(1);
+    }
 
+    uint16_t wanted_txq = static_cast<uint16_t>(dests.size());
+    if (queue_cap != 0 && queue_cap < wanted_txq) wanted_txq = queue_cap;
+
+    detail::BringUp b = detail::bring_up(
+        pool_name, nb_mbufs, cache_size, /*nb_rxd=*/0, nb_txd,
+        /*need_rxq=*/false, wanted_txq);
 
     port_id_ = b.port_id;
     mempool_ = b.mempool;
     src_mac_ = b.mac;
     tx_ip_cksum_offload_ = b.tx_ip_cksum_offload;
+    nb_txq_ = b.nb_txq;
+    max_tx_queues_ = b.max_tx_queues;
+    n_dests_ = static_cast<uint32_t>(dests.size());
     owns_port_ = true;
+
+    for (uint32_t d = 0; d < n_dests_; ++d) {
+      dests_[d].spec = dests[d];
+      dests_[d].queue_id = static_cast<uint16_t>(d % nb_txq_);
+      build_header_template(d);
+    }
   }
 
   ~SenderPort() { teardown(); }
 
   uint16_t port_id() const { return port_id_; }
+  uint16_t n_queues() const { return nb_txq_; }
+  uint16_t max_tx_queues() const { return max_tx_queues_; }
+  uint32_t n_dests() const { return n_dests_; }
+  uint16_t queue_of(uint32_t dest_idx) const { return dests_[dest_idx].queue_id; }
+  const DestSpec& dest(uint32_t dest_idx) const { return dests_[dest_idx].spec; }
 
-  SenderPort(SenderPort&& o) noexcept { *this = std::move(o); }
-  SenderPort& operator=(SenderPort&& o) noexcept {
-    if (this != &o) {
-      teardown();
-      port_id_ = o.port_id_;
-      mempool_ = o.mempool_;
-      src_mac_ = o.src_mac_;
-      dst_mac_ = o.dst_mac_;
-      src_ip_be_ = o.src_ip_be_;
-      dst_ip_be_ = o.dst_ip_be_;
-      src_port_ = o.src_port_;
-      dst_port_ = o.dst_port_;
-      tx_ip_cksum_offload_ = o.tx_ip_cksum_offload_;
-      owns_port_ = o.owns_port_;
-      o.owns_port_ = false;
-    }
-    return *this;
-  }
   SenderPort(const SenderPort&) = delete;
   SenderPort& operator=(const SenderPort&) = delete;
-
-  // One mbuf from the pool. nullptr if the pool is momentarily empty.
-  rte_mbuf* alloc() const noexcept { return rte_pktmbuf_alloc(mempool_); }
-
+  SenderPort(SenderPort&&) = delete;
+  SenderPort& operator=(SenderPort&&) = delete;
 
   bool alloc_bulk(rte_mbuf** mbufs, uint32_t count) const noexcept {
-    int ret = rte_pktmbuf_alloc_bulk(mempool_, mbufs, count);
-    return ret == 0;
+    if (count == 0) return true;
+    return rte_pktmbuf_alloc_bulk(mempool_, mbufs, count) == 0;
   }
 
   // Where to write/copy the payload: right after where the Ethernet/IPv4/UDP
@@ -401,41 +478,125 @@ class SenderPort {
   uint8_t* payload_ptr(rte_mbuf* m) const {
     return rte_pktmbuf_mtod(m, uint8_t*) + kHeaderLen;
   }
+  const uint8_t* payload_ptr(const rte_mbuf* m) const {
+    return rte_pktmbuf_mtod(m, const uint8_t*) + kHeaderLen;
+  }
 
-  // Writes L2/L3/L4 headers in front of a payload already sitting at
-  // payload_ptr(m), and sets the mbuf's length fields / checksum offload
-  // flags accordingly. Reads top-to-bottom as: header, header, header,
-  // lengths, checksum -- each step is its own small function below.
-  void finalize(rte_mbuf* m, uint16_t payload_len) const {
-    const uint16_t udp_len =
-        static_cast<uint16_t>(sizeof(rte_udp_hdr) + payload_len);
-    const uint16_t ip_len =
-        static_cast<uint16_t>(sizeof(rte_ipv4_hdr) + udp_len);
+  // Pulls a whole outgoing packet into L1 in a writable state, ahead of the
+  // code that fills it.
+  //
+  // All four lines are issued explicitly rather than prefetching lines 0 and 2
+  // and leaving the adjacent-line prefetcher to fill in 1 and 3. That trick
+  // needs the packet to start on a 128-byte boundary, and here it does so only
+  // every other time: the mempool lays objects out at a stride of
+  // 64 (header) + 128 (rte_mbuf) + 2176 (buffer) = 2368 bytes, which is 64
+  // modulo 128, so consecutive mbufs alternate and for half of them the
+  // hardware completes the pair in the wrong direction. Four uops is a cheap
+  // price for not depending on that.
+  //
+  // prefetch0_write, not prefetch0: every one of these lines gets stored to, so
+  // the line is wanted in E/M straight away. A read prefetch would land it in S
+  // and the first store would still have to pay for the upgrade.
+  inline static void prefetch_packet(rte_mbuf* m) {
+    static_assert(kHeaderLen + shm::kFrameCap <= 4 * 64,
+                  "prefetch_packet covers exactly four cache lines");
+    // __builtin_prefetch(p, 1, 3) rather than rte_prefetch0_write(): on x86 the
+    // DPDK wrapper is defined as exactly this call, but it carries an
+    // "ABI not yet stable" deprecation attribute that fires on every use and
+    // buries the real warnings under -Wall -Wextra.
+    uint8_t* p = rte_pktmbuf_mtod(m, uint8_t*);
+    __builtin_prefetch(p, /*write=*/1, /*locality=*/3);
+    __builtin_prefetch(p + 64, 1, 3);
+    __builtin_prefetch(p + 128, 1, 3);
+    __builtin_prefetch(p + 192, 1, 3);
+  }
 
-    write_ethernet_header(m);
-    write_ipv4_header(m, ip_len);
-    write_udp_header(m, udp_len);
-    set_mbuf_lengths(m, payload_len);
+  // Puts destination `dest_idx`'s headers in front of a payload already sitting
+  // at payload_ptr(m). The template carries every field that does not depend on
+  // this payload; only three do. Copying the whole template each time (rather
+  // than patching in place) is also what resets hdr_checksum to zero, which
+  // rte_ipv4_cksum() requires -- mbufs here are reused across iterations, so
+  // there is no allocator to do that for us.
+  void finalize(rte_mbuf* m, uint32_t dest_idx, uint16_t payload_len) const {
+    std::memcpy(rte_pktmbuf_mtod(m, void*), dests_[dest_idx].hdr, kHeaderLen);
+    patch_lengths(m, payload_len);
     apply_ip_checksum(m);
   }
 
-  // Give back an mbuf that ended up unused (e.g. the ring had nothing new).
+  // The fan-out step: `src` already holds a finalized packet for destination 0,
+  // `dst` becomes the same payload addressed to `dest_idx`.
+  //
+  // This copies the payload rather than sharing it through an indirect mbuf, and
+  // that is deliberate. At this frame size (<=176 bytes, three cache lines, and
+  // hot in L1 because we wrote it a moment ago) the copy costs less than the
+  // atomic refcount increment and decrement a clone would add. The decisive
+  // reason is not the cost, though: a clone makes the mbuf segmented, and a
+  // segmented packet no longer fits ENA's large-LLQ inline entry. Losing that
+  // means the NIC goes back to DMA-reading the body out of host memory, which
+  // is the single round trip this whole design exists to avoid.
+  //
+  // The copy is a fixed kFrameCap bytes rather than payload_len. The three
+  // message types are 80, 96 and 176 bytes, so a length-driven copy is an
+  // indirect call into memcpy with an unpredictable size; a constant size is
+  // inlined into three 64-byte vector moves with no branch. The surplus bytes
+  // are never transmitted -- data_len is set from payload_len -- and both
+  // buffers have room for them, since kHeaderLen + kFrameCap is asserted to fit
+  // the mbuf dataroom above.
+  void replicate(const rte_mbuf* src, rte_mbuf* dst, uint32_t dest_idx,
+                 uint16_t payload_len) const {
+    std::memcpy(payload_ptr(dst), payload_ptr(src), shm::kFrameCap);
+    finalize(dst, dest_idx, payload_len);
+  }
+
   void discard(rte_mbuf* m) const { rte_pktmbuf_free(m); }
+  void free_bulk(rte_mbuf** m, uint32_t n) const { rte_pktmbuf_free_bulk(m, n); }
 
-  void free_bulk(rte_mbuf**m, uint32_t n) const {rte_pktmbuf_free_bulk(m,n); }
+  // One non-blocking pass at a single queue. The retry policy lives in
+  // send_all() below, which needs to see every queue before spinning on any.
+  uint16_t tx_burst(uint16_t queue_id, rte_mbuf** pkts, uint16_t n) const noexcept {
+    return rte_eth_tx_burst(port_id_, queue_id, pkts, n);
+  }
 
-  // Sends batch and retry kMaxTsSpins times if not hole batch sent
-  inline uint32_t send_with_retry(rte_mbuf** pkts, uint32_t n) const noexcept {
-    uint32_t sent = 0, spins = 0;
-    while (sent < n && spins <  kMaxTxSpins) {
-      uint16_t k = rte_eth_tx_burst(port_id_, 0, pkts + sent, n - sent);
-      sent += k;
-      spins = k ? 0 : spins + 1;
+  // What the caller hands send_all(): one entry per queue that has packets.
+  struct QueueBatch {
+    rte_mbuf** pkts = nullptr;
+    uint16_t total = 0;
+    uint16_t sent = 0;
+  };
+
+  // Drains every queue, and does one pass over all of them before retrying any.
+  //
+  // The ordering matters for exactly the metric this transport is judged on. A
+  // per-queue send_with_retry() would spin up to kMaxTxSpins on queue 0 while
+  // queue 1's packets have not been handed to the NIC at all, so a receiver whose
+  // queue sorts later pays for a transient full ring on a queue that is not even
+  // its own. Round-robin means a full ring delays only its own receiver.
+  void send_all(QueueBatch* batches, uint16_t n_batches) const noexcept {
+    uint32_t spins = 0;
+    for (;;) {
+      bool progressed = false, pending = false;
+      for (uint16_t q = 0; q < n_batches; ++q) {
+        QueueBatch& b = batches[q];
+        if (b.sent >= b.total) continue;
+        const uint16_t k = tx_burst(static_cast<uint16_t>(q), b.pkts + b.sent,
+                                    static_cast<uint16_t>(b.total - b.sent));
+        b.sent = static_cast<uint16_t>(b.sent + k);
+        if (k) progressed = true;
+        if (b.sent < b.total) pending = true;
+      }
+      if (!pending) return;
+      spins = progressed ? 0 : spins + 1;
+      if (spins >= kMaxTxSpins) return;
     }
-    return sent;
   }
 
  private:
+  struct Dest {
+    DestSpec spec;
+    uint16_t queue_id = 0;
+    alignas(16) uint8_t hdr[kHeaderLen];
+  };
+
   // --- header pointer accessors -- one place that knows the packet layout ---
   static rte_ether_hdr* ethernet_header(rte_mbuf* m) {
     return rte_pktmbuf_mtod(m, rte_ether_hdr*);
@@ -447,37 +608,46 @@ class SenderPort {
     return reinterpret_cast<rte_udp_hdr*>(ipv4_header(m) + 1);
   }
 
-  // --- one function per header, each only touches its own fields ---
-  void write_ethernet_header(rte_mbuf* m) const {
-    rte_ether_hdr* eth = ethernet_header(m);
-    eth->dst_addr = dst_mac_;
+  // Built once per destination at construction. Everything that is constant for
+  // the life of the process lives here; total_length, dgram_len and the checksum
+  // are the only per-packet fields, and they are patched by patch_lengths().
+  void build_header_template(uint32_t d) {
+    Dest& dst = dests_[d];
+    std::memset(dst.hdr, 0, kHeaderLen);
+
+    auto* eth = reinterpret_cast<rte_ether_hdr*>(dst.hdr);
+    eth->dst_addr = dst.spec.mac;
     eth->src_addr = src_mac_;
     eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-  }
 
-  void write_ipv4_header(rte_mbuf* m, uint16_t ip_len) const {
-    rte_ipv4_hdr* ip = ipv4_header(m);
+    auto* ip = reinterpret_cast<rte_ipv4_hdr*>(eth + 1);
     ip->version_ihl = 0x45;  // IPv4, 20-byte header, no options
     ip->type_of_service = 0;
-    ip->total_length = rte_cpu_to_be_16(ip_len);
+    ip->total_length = 0;  // per packet
     ip->packet_id = 0;
     ip->fragment_offset = 0;
     ip->time_to_live = 64;
     ip->next_proto_id = IPPROTO_UDP;
-    ip->hdr_checksum = 0;  // filled in by apply_ip_checksum()
+    ip->hdr_checksum = 0;  // per packet; must be zero when rte_ipv4_cksum runs
     ip->src_addr = src_ip_be_;
-    ip->dst_addr = dst_ip_be_;
-  }
+    ip->dst_addr = dst.spec.ip_be;
 
-  void write_udp_header(rte_mbuf* m, uint16_t udp_len) const {
-    rte_udp_hdr* udp = udp_header(m);
+    auto* udp = reinterpret_cast<rte_udp_hdr*>(ip + 1);
     udp->src_port = rte_cpu_to_be_16(src_port_);
-    udp->dst_port = rte_cpu_to_be_16(dst_port_);
-    udp->dgram_len = rte_cpu_to_be_16(udp_len);
+    udp->dst_port = rte_cpu_to_be_16(dst.spec.port);
+    udp->dgram_len = 0;    // per packet
     udp->dgram_cksum = 0;  // legal "unchecked" value for UDP over IPv4
   }
 
-  void set_mbuf_lengths(rte_mbuf* m, uint16_t payload_len) const {
+  void patch_lengths(rte_mbuf* m, uint16_t payload_len) const {
+    const uint16_t udp_len =
+        static_cast<uint16_t>(sizeof(rte_udp_hdr) + payload_len);
+    const uint16_t ip_len =
+        static_cast<uint16_t>(sizeof(rte_ipv4_hdr) + udp_len);
+
+    ipv4_header(m)->total_length = rte_cpu_to_be_16(ip_len);
+    udp_header(m)->dgram_len = rte_cpu_to_be_16(udp_len);
+
     m->data_len = static_cast<uint16_t>(kHeaderLen + payload_len);
     m->pkt_len = m->data_len;
     m->l2_len = sizeof(rte_ether_hdr);
@@ -507,14 +677,15 @@ class SenderPort {
   rte_mempool* mempool_ = nullptr;
 
   uint32_t src_ip_be_ = 0;
-  uint32_t dst_ip_be_ = 0;
   uint16_t src_port_ = 0;
-  uint16_t dst_port_ = 0;
 
   uint16_t port_id_ = 0;
+  uint16_t nb_txq_ = 0;
+  uint16_t max_tx_queues_ = 0;
+  uint32_t n_dests_ = 0;
 
   rte_ether_addr src_mac_{};
-  rte_ether_addr dst_mac_{};
+  Dest dests_[kMaxDests]{};
 
   bool tx_ip_cksum_offload_ = false;
   bool owns_port_ = false;
@@ -531,7 +702,7 @@ class ReceiverPort {
                uint32_t cache_size, uint16_t nb_rxd) {
     detail::BringUp b =
         detail::bring_up(pool_name, nb_mbufs, cache_size, nb_rxd,
-                          /*nb_txd=*/128, /*need_rxq=*/true, /*need_txq=*/false);
+                          /*nb_txd=*/128, /*need_rxq=*/true, /*wanted_txq=*/0);
     port_id_ = b.port_id;
     mempool_ = b.mempool;
     owns_port_ = true;
