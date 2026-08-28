@@ -30,7 +30,7 @@
 //   dpdk_sender [EAL args] -- --shm NAME --slots N --src-ip IP
 //               --dest MAC@IP:PORT [--dest ...]
 //               [--src-port P] [--burst N] [--mbufs N] [--txd N] [--count N]
-//               [--tx-queues N]
+//               [--tx-queues N] [--tx-spins N]
 //
 // --tx-queues caps the queue count (default: one per destination, as many as
 // the device allows). Setting it to 1 puts every receiver on a single queue,
@@ -79,6 +79,7 @@ struct Config {
   // tx_desc_lim from the dev_info banner if this needs changing.
   uint16_t txd = 512;
   uint16_t tx_queues = 0;  // 0 = one per destination, capped by the device
+  uint32_t tx_spins = dpdk::kDefaultTxSpins;
 
   // Every receiver, in the order given. One receiver is not a special case --
   // it is a table with one row, which is why there is no second addressing form
@@ -160,6 +161,7 @@ Config parse_args(int argc, char** argv) {
     else if (a == "--count") c.count = parse_uint("--count", next(), UINT32_MAX);
     else if (a == "--txd") c.txd = static_cast<decltype(c.txd)>(parse_uint("--txd", next(), 65535));
     else if (a == "--tx-queues") c.tx_queues = static_cast<decltype(c.tx_queues)>(parse_uint("--tx-queues", next(), 65535));
+    else if (a == "--tx-spins") c.tx_spins = parse_uint("--tx-spins", next(), 1000);
     else {
       std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
       std::exit(2);
@@ -237,6 +239,8 @@ int main(int argc, char** argv) {
   dpdk::SenderPort sender("sender_pool", cfg.nb_mbufs, cfg.cache_size,
                           /*nb_txd=*/cfg.txd, cfg.dests, src_ip_be,
                           cfg.src_port, cfg.tx_queues);
+
+  sender.set_tx_spins(cfg.tx_spins);
 
   const uint32_t n_dests = sender.n_dests();
   const uint16_t n_queues = sender.n_queues();
@@ -426,12 +430,17 @@ int main(int argc, char** argv) {
     if (!refill_ok) break;
   }
 
-  // Фактический темп, а не заказанный. Без него развёртку по числу
-  // получателей нельзя прочитать: заказанный RATE говорит, чего мы хотели, а
-  // упираемся мы в пакеты в секунду, и именно их надо сопоставлять с
-  // pps_allowance_exceeded ниже.
+  // Фактический темп, а не заказанный. Два разных числа, и путать их нельзя:
+  // из кольца мы читаем одно количество, а на провод уходит меньше на
+  // tx_dropped. С pps-квотой ENI и с pps_allowance_exceeded сопоставляется
+  // только отправленное -- предложенное карта не видела.
   const double elapsed_s =
       static_cast<double>(util::now_ns() - t_start) / 1e9;
+  uint64_t total_sent = 0, total_dropped = 0;
+  for (uint32_t d = 0; d < n_dests; ++d) {
+    total_sent += dstats[d].sent;
+    total_dropped += dstats[d].dropped;
+  }
 
   // До выхода из main: деструктор порта делает dev_stop/close.
   dpdk::print_port_stats(sender.port_id());
@@ -444,10 +453,13 @@ int main(int argc, char** argv) {
                "alloc_fail : %llu\t(mbuf pool empty)\n"
                "empty_spins: %llu\t(read from ring return none)\n"
                "avg_burst  : %.2f\t(avg messages in burst, wanted to send by burst)\n"
+               "tx_spins   : %u\t(ретраев на полном TX-кольце, прежде чем выбросить)\n"
                "elapsed    : %.1f s\n"
-               "msg rate   : %.0f msg/s\t(фактический, не заказанный)\n"
-               "pkt rate   : %.0f pkt/s\t(msg/s x %u получателей -- это и есть\n"
-               "             \t\t то, что упирается в pps-квоту ENI)\n",
+               "msg in     : %.0f msg/s\t(прочитано из кольца)\n"
+               "pkt offered: %.0f pkt/s\t(msg in x %u получателей)\n"
+               "pkt sent   : %.0f pkt/s\t(ПРИНЯТО картой -- только это\n"
+               "             \t\t сопоставимо с pps_allowance_exceeded)\n"
+               "tx_dropped : %llu\t(%.1f%% -- TX-кольцо было полно)\n",
                static_cast<unsigned long long>(msgs),
                n_dests, static_cast<unsigned>(n_queues),
                static_cast<unsigned>(sender.max_tx_queues()),
@@ -455,10 +467,17 @@ int main(int argc, char** argv) {
                static_cast<unsigned long long>(alloc_fail),
                static_cast<unsigned long long>(empty_spins),
                bursts ? static_cast<double>(burst_msgs) / static_cast<double>(bursts) : 0.0,
+               sender.tx_spins(),
                elapsed_s,
                elapsed_s > 0 ? static_cast<double>(msgs) / elapsed_s : 0.0,
                elapsed_s > 0 ? static_cast<double>(msgs) * n_dests / elapsed_s : 0.0,
-               n_dests);
+               n_dests,
+               elapsed_s > 0 ? static_cast<double>(total_sent) / elapsed_s : 0.0,
+               static_cast<unsigned long long>(total_dropped),
+               (total_sent + total_dropped)
+                   ? static_cast<double>(total_dropped) * 100.0 /
+                         static_cast<double>(total_sent + total_dropped)
+                   : 0.0);
 
   for (uint32_t d = 0; d < n_dests; ++d) {
     std::fprintf(stderr,

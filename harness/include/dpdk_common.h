@@ -36,7 +36,17 @@
 
 namespace dpdk {
 
-inline constexpr uint32_t kMaxTxSpins = 10;
+// Сколько раз подряд обойти очереди без единого отправленного пакета, прежде
+// чем сдаться и посчитать остаток потерянным. Значение по умолчанию, ручка --
+// SenderPort::set_tx_spins().
+//
+// Число не безобидное. Под перегрузкой почти каждый пакет обречён, и тогда
+// стоимость одного сообщения -- это kMaxTxSpins холостых обращений к tx_burst,
+// а не одно. Измерено на ENA при 2M msg/s на одного получателя: 92% всех
+// вызовов tx_burst не отправили ничего, и это порядка половины ядра
+// отправителя, потраченного на пакеты, которые всё равно будут выброшены.
+// Занижение обменивает эту работу на более ранний отказ.
+inline constexpr uint32_t kDefaultTxSpins = 10;
 inline constexpr uint32_t kMaxRxSpins = 10;
 
 // "AA:BB:CC:DD:EE:FF" -> rte_ether_addr. Hand-parsed, no dependency on
@@ -528,6 +538,9 @@ class SenderPort {
   uint16_t port_id() const { return port_id_; }
   uint16_t n_queues() const { return nb_txq_; }
   uint16_t max_tx_queues() const { return max_tx_queues_; }
+
+  uint32_t tx_spins() const { return tx_spins_; }
+  void set_tx_spins(uint32_t n) { tx_spins_ = n ? n : 1; }
   uint32_t n_dests() const { return n_dests_; }
   uint16_t queue_of(uint32_t dest_idx) const { return dests_[dest_idx].queue_id; }
   const DestSpec& dest(uint32_t dest_idx) const { return dests_[dest_idx].spec; }
@@ -638,7 +651,7 @@ class SenderPort {
   // Drains every queue, and does one pass over all of them before retrying any.
   //
   // The ordering matters for exactly the metric this transport is judged on. A
-  // per-queue send_with_retry() would spin up to kMaxTxSpins on queue 0 while
+  // per-queue send_with_retry() would spin up to tx_spins_ on queue 0 while
   // queue 1's packets have not been handed to the NIC at all, so a receiver whose
   // queue sorts later pays for a transient full ring on a queue that is not even
   // its own. Round-robin means a full ring delays only its own receiver.
@@ -657,7 +670,7 @@ class SenderPort {
       }
       if (!pending) return;
       spins = progressed ? 0 : spins + 1;
-      if (spins >= kMaxTxSpins) return;
+      if (spins >= tx_spins_) return;
     }
   }
 
@@ -757,6 +770,8 @@ class SenderPort {
 
   rte_ether_addr src_mac_{};
   Dest dests_[kMaxDests]{};
+
+  uint32_t tx_spins_ = kDefaultTxSpins;
 
   bool tx_ip_cksum_offload_ = false;
   bool owns_port_ = false;

@@ -8,6 +8,7 @@
 #   sudo RATE=500000 BURST=8 ./scripts/tx.sh
 #   sudo RECEIVERS=2 ./scripts/tx.sh          # только первые 2 из PEERS
 #   sudo COUNT=5000000 ./scripts/tx.sh        # выйти самому, без Ctrl+C
+#   sudo TX_SPINS=1 ./scripts/tx.sh           # не крутиться на полном TX-кольце
 #
 # Размеры TX-очереди и пула mbuf -- SENDER_TXD/SENDER_MBUFS в host.conf.
 #
@@ -25,6 +26,7 @@ TYPE=${TYPE:-mixed}           # trade | bbo | book | mixed
 SLOTS=${SLOTS:-1024}
 BURST=${BURST:-32}
 COUNT=${COUNT:-0}             # сообщений и выйти; 0 = бесконечно, до Ctrl+C
+TX_SPINS=${TX_SPINS:-10}      # ретраев на полном TX-кольце, прежде чем выбросить
 
 # Проверяем до need_root: с опечаткой в конфиге незачем даже спрашивать пароль.
 need_uint SENDER_TXD "$SENDER_TXD" 64 4096
@@ -34,6 +36,7 @@ need_uint BURST "$BURST" 1 512
 need_uint SLOTS "$SLOTS" 8 1048576
 need_pow2 SLOTS "$SLOTS"
 need_uint COUNT "$COUNT" 0 100000000000
+need_uint TX_SPINS "$TX_SPINS" 1 1000
 
 # Получатели. Форма адресации ровно одна -- список MAC@IP:PORT; пара
 # PEER_MAC/PEER_IP сворачивается в него здесь же. Дальше ни скрипт, ни сам
@@ -110,7 +113,7 @@ for peer in $PEERS; do row "  ->" "$peer"; done
 row устройство "$DEV"
 row ядра "producer $CPU_PRODUCER, отправитель $CPU_SENDER"
 row темп "$RATE msg/s, тип $TYPE"
-row очередь "TX $SENDER_TXD дескрипторов, burst $BURST"
+row очередь "TX $SENDER_TXD дескрипторов, burst $BURST, ретраев $TX_SPINS"
 row пул "$SENDER_MBUFS mbuf"
 [ "$COUNT" = 0 ] || row остановка "после $COUNT сообщений"
 row логи "$RUN"
@@ -132,7 +135,8 @@ taskset -c "$CPU_SENDER" setarch -R ./bin/dpdk_sender \
   $DEV \
   -- --shm /fanout_ring --slots "$SLOTS" \
      --src-ip "$SRC_IP" "${DEST_ARGS[@]}" --burst "$BURST" \
-     --mbufs "$SENDER_MBUFS" --txd "$SENDER_TXD" "${COUNT_ARG[@]}" \
+     --mbufs "$SENDER_MBUFS" --txd "$SENDER_TXD" --tx-spins "$TX_SPINS" \
+     "${COUNT_ARG[@]}" \
   > "$RUN/sender.log" 2>&1 &
 SENDER=$!
 

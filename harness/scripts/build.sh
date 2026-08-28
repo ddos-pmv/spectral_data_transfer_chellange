@@ -2,7 +2,14 @@
 # Разовая установка DPDK и igb_uio на чистую Ubuntu 24.04. Идемпотентна.
 #
 #   sudo ./scripts/build.sh
-#   sudo WITH_IGB_UIO=0 ./scripts/build.sh    # без ENA PMD, только AF_XDP
+#   sudo WITH_IGB_UIO=0 ./scripts/build.sh   # не собирать igb_uio
+#   sudo REBUILD=1 ./scripts/build.sh        # пересобрать, даже если DPDK стоит
+#
+# REBUILD=1 нужен после СМЕНЫ ТИПА ИНСТАНСА. Сборка идёт с -Dplatform=native,
+# то есть под конкретный CPU, и при переезде (скажем, Sapphire Rapids -> Ice
+# Lake) старые бинарники падают по SIGILL. Обычная проверка "DPDK уже стоит"
+# в этом случае вредна: она пропустит пересборку, а pkg-config продолжит
+# отдавать -march прошлой машины и в harness.
 #
 # Настройку машины это НЕ делает -- она в ./scripts/host.sh
 set -euo pipefail
@@ -24,8 +31,10 @@ apt-get install -y -qq \
   libnuma-dev libbpf-dev libxdp-dev ethtool chrony pciutils \
   linux-headers-"$(uname -r)" linux-tools-"$(uname -r)" linux-tools-common
 
-if pkg-config --exists libdpdk 2>/dev/null; then
+REBUILD=${REBUILD:-0}
+if [ "$REBUILD" = 0 ] && pkg-config --exists libdpdk 2>/dev/null; then
   say "DPDK уже установлен: $(pkg-config --modversion libdpdk)"
+  say "  (сменили тип инстанса? нужен sudo REBUILD=1 ./scripts/build.sh)"
 else
   say "Сборка DPDK $DPDK_VER (несколько минут)"
   mkdir -p "$SRC" && cd "$SRC"
@@ -33,10 +42,27 @@ else
   cd dpdk-stable
   git fetch --quiet --tags
   git checkout --quiet "$DPDK_VER"
-  # Драйвер net_ena собирается отдельным .so и подгружается
-  # EAL в рантайме -- поэтому важна и сборка, и ldconfig ниже.
-  meson setup build --prefix=/usr/local -Dplatform=native -Dbuildtype=release
+
+  # Каталог сборки сносится: meson кэширует -march, и после смены типа
+  # инстанса переконфигурация поверх старого build даёт флаги прошлой машины.
+  rm -rf build
+
+  # Только net_ena: решение работает на ENA и ни на чём другом, а каждый лишний
+  # драйвер -- это и время сборки, и лишний .so, который EAL будет открывать.
+  meson setup build --prefix=/usr/local -Dplatform=native -Dbuildtype=release \
+        -Denable_drivers=net/ena -Dtests=false
   ninja -C build
+
+  # Старые PMD сносятся ПОСЛЕ успешной сборки и перед установкой, а не раньше:
+  # упавшая сборка не должна оставить машину вообще без драйверов.
+  #
+  # Сносить обязательно, потому что `ninja install` старые .so не удаляет --
+  # только докладывает новые, -- а EAL при старте делает dlopen ВСЕГО, что
+  # найдёт в pmds-*. После пересборки под другой CPU один залежавшийся драйвер
+  # уронит процесс по SIGILL прямо в rte_eal_init, ещё до нашего кода, и
+  # выглядеть это будет необъяснимо.
+  rm -rf "$LIBDIR"/dpdk/pmds-*
+
   ninja -C build install
 fi
 
