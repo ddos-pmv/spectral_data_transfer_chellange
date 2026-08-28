@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
       // path, so caches, branch predictors and the ring pages are warm by the
       // time the first recorded sample is taken.
       if (consumed >= cfg.warmup) {
-        acc.record(hdr->seq_id, latency, a_ns, b_ns, c_ns);
+        acc.record(hdr->seq_id, hdr->send_ts_ns, latency, a_ns, b_ns, c_ns);
         ++received;
       }
       ++consumed;

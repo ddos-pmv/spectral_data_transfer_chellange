@@ -85,6 +85,7 @@ struct BringUp {
   rte_mempool* mempool;
   rte_ether_addr mac;
   bool tx_ip_cksum_offload;
+  bool tx_mbuf_fast_free;
   uint16_t nb_rxq;          // RX queues actually created
   uint16_t nb_txq;          // TX queues actually created
   uint16_t max_rx_queues;   // what the device would have allowed
@@ -154,6 +155,27 @@ inline bool supports_ip_cksum_offload(const rte_eth_dev_info& info) {
   return (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
 }
 
+// MBUF_FAST_FREE is not a feature the card performs -- it is a promise the
+// application makes to the driver about every mbuf it will hand to tx_burst:
+//
+//   1. all of them come from one mempool,
+//   2. none is segmented (nb_segs == 1, no `next` chain),
+//   3. none is shared (refcnt == 1, no indirect/cloned mbufs).
+//
+// Given that, the PMD's completion path drops the per-mbuf work -- the refcount
+// atomic, the segment walk, the is-this-a-clone check -- and returns the whole
+// batch to the pool with one rte_mempool_put_bulk instead of freeing one at a
+// time.
+//
+// SenderPort satisfies all three structurally, not by luck: it owns exactly one
+// pool, fills every packet with a single memcpy into one segment, and copies
+// rather than clones on fan-out (see replicate()). That last one is load-bearing
+// here -- switching fan-out to indirect mbufs would break promise 3 and turn
+// this flag into memory corruption rather than a slowdown.
+inline bool supports_mbuf_fast_free(const rte_eth_dev_info& info) {
+  return (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) != 0;
+}
+
 inline rte_mempool* create_mbuf_pool(const std::string& name,
                                       uint32_t nb_mbufs,
                                       uint32_t cache_size) {
@@ -169,11 +191,9 @@ inline rte_mempool* create_mbuf_pool(const std::string& name,
 }
 
 inline void configure_device(uint16_t port_id, uint16_t nb_rxq, uint16_t nb_txq,
-                              bool ip_cksum_offload) {
+                              uint64_t tx_offloads) {
   rte_eth_conf eth_conf{};
-  if (ip_cksum_offload) {
-    eth_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
-  }
+  eth_conf.txmode.offloads = tx_offloads;
   int ret = rte_eth_dev_configure(port_id, nb_rxq, nb_txq, &eth_conf);
   if (ret != 0) {
     std::fprintf(stderr, "rte_eth_dev_configure failed: %s\n",
@@ -238,9 +258,9 @@ inline void setup_rx_queue(uint16_t port_id, uint16_t queue_id, uint16_t nb_rxd,
 
 inline void setup_tx_queue(uint16_t port_id, uint16_t queue_id, uint16_t nb_txd,
                             const rte_eth_dev_info& dev_info,
-                            bool ip_cksum_offload) {
+                            uint64_t tx_offloads) {
   rte_eth_txconf txconf = dev_info.default_txconf;
-  txconf.offloads = ip_cksum_offload ? RTE_ETH_TX_OFFLOAD_IPV4_CKSUM : 0;
+  txconf.offloads = tx_offloads;
   int ret = rte_eth_tx_queue_setup(port_id, queue_id, nb_txd, rte_socket_id(),
                                     &txconf);
   if (ret != 0) {
@@ -322,10 +342,15 @@ inline BringUp bring_up(const std::string& pool_name, uint32_t nb_mbufs,
   }
 
   b.tx_ip_cksum_offload = b.nb_txq != 0 && supports_ip_cksum_offload(dev_info);
+  b.tx_mbuf_fast_free = b.nb_txq != 0 && supports_mbuf_fast_free(dev_info);
+
+  uint64_t tx_offloads = 0;
+  if (b.tx_ip_cksum_offload) tx_offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+  if (b.tx_mbuf_fast_free) tx_offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
   b.mempool = create_mbuf_pool(pool_name, nb_mbufs, cache_size);
 
-  configure_device(b.port_id, b.nb_rxq, b.nb_txq, b.tx_ip_cksum_offload);
+  configure_device(b.port_id, b.nb_rxq, b.nb_txq, tx_offloads);
 
   // Null for a direction we do not use -- see adjust_descriptor_counts_strong.
   adjust_descriptor_counts_strong(b.port_id, b.nb_rxq ? &nb_rxd : nullptr,
@@ -335,15 +360,16 @@ inline BringUp bring_up(const std::string& pool_name, uint32_t nb_mbufs,
     setup_rx_queue(b.port_id, q, nb_rxd, b.mempool);
   }
   for (uint16_t q = 0; q < b.nb_txq; ++q) {
-    setup_tx_queue(b.port_id, q, nb_txd, dev_info, b.tx_ip_cksum_offload);
+    setup_tx_queue(b.port_id, q, nb_txd, dev_info, tx_offloads);
   }
 
   start_device(b.port_id);
   b.mac = read_mac_address(b.port_id);
 
   std::fprintf(stderr,
-               "dpdk: port %u up (ip_cksum_hw=%d, rx_queues=%u, tx_queues=%u)\n",
-               b.port_id, b.tx_ip_cksum_offload,
+               "dpdk: port %u up (ip_cksum_hw=%d, mbuf_fast_free=%d, "
+               "rx_queues=%u, tx_queues=%u)\n",
+               b.port_id, b.tx_ip_cksum_offload, b.tx_mbuf_fast_free,
                static_cast<unsigned>(b.nb_rxq),
                static_cast<unsigned>(b.nb_txq));
   return b;

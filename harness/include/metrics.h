@@ -53,6 +53,14 @@ struct Report {
 
 struct Sample {
   uint64_t seq_id;
+  // The producer's own stamp, kept so a sample can be placed on a wall clock
+  // afterwards. That is what lets an externally measured clock-offset series be
+  // joined to these samples and subtracted from b_ns per sample rather than as
+  // one constant per run -- the offset between two free-running hosts moves
+  // during a multi-minute run, and a single correction would smear the very
+  // tail the run exists to measure. seq_id alone is not a substitute: it is a
+  // time axis only while the producer's rate is exactly constant.
+  uint64_t send_ts_ns;
   int64_t e2e_ns;
   int64_t a_ns;
   int64_t b_ns;
@@ -72,8 +80,8 @@ class Accumulator {
     }
   }
 
-  void record(uint64_t seq_id, int64_t e2e_ns, int64_t a_ns, int64_t b_ns,
-              int64_t c_ns) {
+  void record(uint64_t seq_id, uint64_t send_ts_ns, int64_t e2e_ns,
+              int64_t a_ns, int64_t b_ns, int64_t c_ns) {
     if (received_ == 0) {
       first_seq_ = seq_id;
       last_seq_ = seq_id;
@@ -82,7 +90,7 @@ class Accumulator {
       if (seq_id > last_seq_) last_seq_ = seq_id;
     }
     ++received_;
-    samples_.push_back(Sample{seq_id, e2e_ns, a_ns, b_ns, c_ns});
+    samples_.push_back(Sample{seq_id, send_ts_ns, e2e_ns, a_ns, b_ns, c_ns});
     sum_e2e_ += static_cast<double>(e2e_ns);
     sum_a_ += static_cast<double>(a_ns);
     sum_b_ += static_cast<double>(b_ns);
@@ -118,10 +126,11 @@ class Accumulator {
   bool write_csv(const std::string& path) const {
     FILE* f = std::fopen(path.c_str(), "w");
     if (!f) return false;
-    std::fprintf(f, "seq,latency_ns,a_ns,b_ns,c_ns\n");
+    std::fprintf(f, "seq,send_ts_ns,latency_ns,a_ns,b_ns,c_ns\n");
     for (const Sample& s : samples_) {
-      std::fprintf(f, "%llu,%lld,%lld,%lld,%lld\n",
-                   (unsigned long long)s.seq_id, (long long)s.e2e_ns,
+      std::fprintf(f, "%llu,%llu,%lld,%lld,%lld,%lld\n",
+                   (unsigned long long)s.seq_id,
+                   (unsigned long long)s.send_ts_ns, (long long)s.e2e_ns,
                    (long long)s.a_ns, (long long)s.b_ns, (long long)s.c_ns);
     }
     return std::fclose(f) == 0;

@@ -301,6 +301,7 @@ int main(int argc, char** argv) {
   ring.attach(seg.base(), cfg.slots, /*init=*/false);
 
   uint64_t read_index = ring.live_edge();
+  const uint64_t t_start = util::now_ns();
   uint64_t msgs = 0, lapped = 0, alloc_fail = 0, empty_spins = 0;
   uint64_t bursts = 0, burst_msgs = 0;
   DestStats dstats[kMaxDests];
@@ -425,6 +426,13 @@ int main(int argc, char** argv) {
     if (!refill_ok) break;
   }
 
+  // Фактический темп, а не заказанный. Без него развёртку по числу
+  // получателей нельзя прочитать: заказанный RATE говорит, чего мы хотели, а
+  // упираемся мы в пакеты в секунду, и именно их надо сопоставлять с
+  // pps_allowance_exceeded ниже.
+  const double elapsed_s =
+      static_cast<double>(util::now_ns() - t_start) / 1e9;
+
   // До выхода из main: деструктор порта делает dev_stop/close.
   dpdk::print_port_stats(sender.port_id());
 
@@ -435,14 +443,22 @@ int main(int argc, char** argv) {
                "lapped     : %llu\t(producer overwrote us; frames skipped)\n"
                "alloc_fail : %llu\t(mbuf pool empty)\n"
                "empty_spins: %llu\t(read from ring return none)\n"
-               "avg_burst  : %.2f\t(avg messages in burst)\n",
+               "avg_burst  : %.2f\t(avg messages in burst, wanted to send by burst)\n"
+               "elapsed    : %.1f s\n"
+               "msg rate   : %.0f msg/s\t(фактический, не заказанный)\n"
+               "pkt rate   : %.0f pkt/s\t(msg/s x %u получателей -- это и есть\n"
+               "             \t\t то, что упирается в pps-квоту ENI)\n",
                static_cast<unsigned long long>(msgs),
                n_dests, static_cast<unsigned>(n_queues),
                static_cast<unsigned>(sender.max_tx_queues()),
                static_cast<unsigned long long>(lapped),
                static_cast<unsigned long long>(alloc_fail),
                static_cast<unsigned long long>(empty_spins),
-               bursts ? static_cast<double>(burst_msgs) / static_cast<double>(bursts) : 0.0);
+               bursts ? static_cast<double>(burst_msgs) / static_cast<double>(bursts) : 0.0,
+               elapsed_s,
+               elapsed_s > 0 ? static_cast<double>(msgs) / elapsed_s : 0.0,
+               elapsed_s > 0 ? static_cast<double>(msgs) * n_dests / elapsed_s : 0.0,
+               n_dests);
 
   for (uint32_t d = 0; d < n_dests; ++d) {
     std::fprintf(stderr,

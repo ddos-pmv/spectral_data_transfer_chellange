@@ -8,8 +8,21 @@ LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(dirname "$LIB_DIR")
 
 if [ -f "$LIB_DIR/host.conf" ]; then
+  # Окружение сильнее файла -- но host.conf присваивает без :-, поэтому простой
+  # `. host.conf` затирал бы переменные, заданные в командной строке. Тихо: ни
+  # ошибки, ни предупреждения, просто прогон идёт не с теми числами, которые вы
+  # написали. Поэтому: запоминаем всё, что уже задано и упоминается в файле,
+  # читаем файл, возвращаем запомненное на место.
+  __hc_saved=()
+  while read -r __hc_key; do
+    [ -n "${!__hc_key+set}" ] && __hc_saved+=("$(declare -p "$__hc_key")")
+  done < <(sed -nE 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/p' "$LIB_DIR/host.conf" | sort -u)
+
   # shellcheck disable=SC1091
   . "$LIB_DIR/host.conf"
+
+  for __hc_decl in ${__hc_saved+"${__hc_saved[@]}"}; do eval "$__hc_decl"; done
+  unset __hc_saved __hc_decl __hc_key
 elif [ -z "${HOSTCONF_WARNED:-}" ]; then
   # host.sh зовёт четыре скрипта подряд, каждый подключает lib.sh -- ругаемся один раз.
   export HOSTCONF_WARNED=1
@@ -17,8 +30,8 @@ elif [ -z "${HOSTCONF_WARNED:-}" ]; then
   echo "  cp scripts/host.conf.example scripts/host.conf" >&2
 fi
 
-# Значения по умолчанию ставим ПОСЛЕ конфига и через :-, поэтому переменная
-# окружения перебивает файл, а файл перебивает эти дефолты.
+# Значения по умолчанию ставим ПОСЛЕ конфига и через :-, поэтому файл
+# перебивает эти дефолты. Приоритет целиком: окружение > host.conf > дефолт.
 DPDK_IFACE=${DPDK_IFACE:-enp40s0}
 DPDK_PCI=${DPDK_PCI:-}
 DPDK_ENI_INDEX=${DPDK_ENI_INDEX:-1}
