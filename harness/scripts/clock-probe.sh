@@ -17,15 +17,19 @@
 # фазе end. Если оставить его работающим хоть на одной, смещение перестаёт быть
 # прямой и линейная коррекция даст неверные числа с видом достоверных.
 #
-# Карта на время замера возвращается ядру: пробник ходит обычными сокетами, а у
-# отданной DPDK карты у ядра нет её адреса. Возврат под DPDK -- через trap,
-# чтобы прерванный замер не оставил стенд без карты.
+# Пробник ходит по УПРАВЛЯЮЩЕМУ интерфейсу (ens5), а не по карте под DPDK.
+# Смещение -- свойство пары часов, а не пути, поэтому измерять его можно по
+# любому каналу. Карту при этом не надо ни отвязывать, ни возвращать: у
+# вторичной ENI после возврата ядру всё равно нет адреса, пока ей не отработает
+# DHCP, так что тот путь просто не работает.
 set -euo pipefail
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
 cd "$ROOT_DIR"
 
 PROBE=${PROBE:-bin/clock_probe}
 PROBE_PORT=${PROBE_PORT:-51100}
+MGMT_IFACE=${MGMT_IFACE:-ens5}     # интерфейс, по которому ходит пробник
+PROBE_PEER=${PROBE_PEER:-}         # адрес второй машины на этом интерфейсе
 PROBE_COUNT=${PROBE_COUNT:-20000}
 PROBE_IDLE_S=${PROBE_IDLE_S:-90}   # отражатель ждёт столько без трафика и выходит
 STATE=${PROBE_STATE_DIR:-/tmp}
@@ -37,8 +41,12 @@ case "$name" in *-rx*) ROLE=rx ;; *-tx*) ROLE=tx ;;
   *) die "зовите через clock-probe-{start,end}-{rx,tx}.sh" ;; esac
 
 [ -x "$PROBE" ] || die "нет $PROBE -- make -j$(nproc)"
-[ "$ROLE" = rx ] || [ -n "${PEER_IP:-}" ] \
-  || die "PEER_IP пуст -- впишите в host.conf адрес приёмника"
+mgmt_ip() { ip -4 -o addr show "$MGMT_IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1; }
+
+[ "$ROLE" = rx ] || [ -n "$PROBE_PEER" ] || die "PROBE_PEER пуст.
+   Это адрес второй машины на управляющем интерфейсе ($MGMT_IFACE), не на карте
+   под DPDK. Посмотреть там: ip -4 -o addr show $MGMT_IFACE
+   Вписать в host.conf: PROBE_PEER=<адрес>"
 
 need_root
 
@@ -48,10 +56,6 @@ if [ "$PHASE" = start ]; then
   row chrony "остановлен (вернётся в clock-probe-end-$ROLE.sh)"
 fi
 
-say "Возвращаю карту ядру на время замера"
-trap './scripts/nic.sh bind >/dev/null 2>&1 || true' EXIT
-./scripts/nic.sh unbind >/dev/null
-
 # В выводе пробника "p50=" и число разделены пробелами, поэтому по полям awk их
 # не собрать -- берём регуляркой по строке. Знак минус обязателен: смещение
 # бывает отрицательным, и потерять минус хуже, чем не разобрать вовсе.
@@ -60,20 +64,20 @@ parse_offset() {
 }
 
 if [ "$ROLE" = rx ]; then
-  MY_IP=${SRC_IP:-$(local_ip)}
-  [ -n "$MY_IP" ] || die "не определить свой IP -- задайте SRC_IP=..."
+  MY_IP=$(mgmt_ip)
+  [ -n "$MY_IP" ] || die "не определить адрес $MGMT_IFACE -- задайте MGMT_IFACE=..."
   say "Отражатель ($PHASE)"
-  row адрес "$MY_IP:$PROBE_PORT"
+  row адрес "$MY_IP:$PROBE_PORT  ($MGMT_IFACE)"
   row выход "через $PROBE_IDLE_S с тишины"
   echo "   теперь на отправителе: sudo ./scripts/clock-probe-$PHASE-tx.sh"
   echo
   "$PROBE" --reflect --bind "$MY_IP" --port "$PROBE_PORT" --idle-s "$PROBE_IDLE_S"
 else
   say "Замер смещения ($PHASE)"
-  row отражатель "$PEER_IP:$PROBE_PORT"
+  row отражатель "$PROBE_PEER:$PROBE_PORT  ($MGMT_IFACE)"
   row образцов "$PROBE_COUNT"
   echo
-  "$PROBE" --probe --peer "$PEER_IP:$PROBE_PORT" --count "$PROBE_COUNT" \
+  "$PROBE" --probe --peer "$PROBE_PEER:$PROBE_PORT" --count "$PROBE_COUNT" \
     | tee "$STATE/clock_probe_$PHASE.txt"
   OFF=$(parse_offset "$STATE/clock_probe_$PHASE.txt")
 fi
