@@ -55,18 +55,24 @@ sudo RATE=500000 ./scripts/tx.sh
 sudo ./scripts/host.sh apply
 ```
 
-## Замер без доверия к часам
+## Замер со снятием смещения часов
 
 ```bash
-sudo systemctl stop chrony          # на ОБЕИХ машинах
-# прогон A->B, затем B->A
-sudo systemctl start chrony
+# приёмник                          # отправитель
+sudo ./scripts/clock-probe-start-rx.sh
+                                    sudo ./scripts/clock-probe-start-tx.sh
+sudo ./scripts/rx.sh                sudo ./scripts/tx.sh
+sudo ./scripts/clock-probe-end-rx.sh
+                                    sudo ./scripts/clock-probe-end-tx.sh
+
+./scripts/summarize.py results/rx-*/latencies.csv --offset-before A --offset-after B
 ```
 
-Задержка `d = (AB+BA)/2`, смещение часов `= (AB-BA)/2`, по каждому процентилю
-отдельно.
+`clock-probe-*` останавливает chrony на обеих машинах: тогда смещение уходит по
+прямой, и двух замеров хватает, чтобы вычесть его поточечно.
 
 ## Прочее
 
-`local_bench.py` `local_bench.toml` `dpdk_local_bench.py` `dpdk_local_bench.toml` — прогоны по конфигу.
-`profilers.py` `profreport.py` `vtune_setup.sh` — профилирование.
+`summarize.py` — перцентили по CSV, с необязательной коррекцией часов.
+`clock-probe-{start,end}-{rx,tx}.sh` — смещение часов до и после прогона.
+`fetch-results.sh` — забрать результаты со стенда.

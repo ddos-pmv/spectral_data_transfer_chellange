@@ -44,6 +44,10 @@ target_include_directories(sender PRIVATE include)
 add_executable(receiver src/receiver.cpp)
 target_include_directories(receiver PRIVATE include)
 
+# 5. Clock probe -- смещение часов между хостами, обычные сокеты, без DPDK
+add_executable(clock_probe src/clock_probe.cpp)
+target_include_directories(clock_probe PRIVATE include)
+
 
 
 find_package(PkgConfig REQUIRED)

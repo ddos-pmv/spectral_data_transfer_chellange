@@ -165,23 +165,13 @@ inline bool supports_ip_cksum_offload(const rte_eth_dev_info& info) {
   return (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
 }
 
-// MBUF_FAST_FREE is not a feature the card performs -- it is a promise the
-// application makes to the driver about every mbuf it will hand to tx_burst:
+// Not a card feature but a promise: every mbuf handed to tx_burst comes from one
+// pool, is unsegmented, and is unshared. The PMD then frees the batch with one
+// put_bulk instead of per-mbuf refcount/segment/clone checks.
 //
-//   1. all of them come from one mempool,
-//   2. none is segmented (nb_segs == 1, no `next` chain),
-//   3. none is shared (refcnt == 1, no indirect/cloned mbufs).
-//
-// Given that, the PMD's completion path drops the per-mbuf work -- the refcount
-// atomic, the segment walk, the is-this-a-clone check -- and returns the whole
-// batch to the pool with one rte_mempool_put_bulk instead of freeing one at a
-// time.
-//
-// SenderPort satisfies all three structurally, not by luck: it owns exactly one
-// pool, fills every packet with a single memcpy into one segment, and copies
-// rather than clones on fan-out (see replicate()). That last one is load-bearing
-// here -- switching fan-out to indirect mbufs would break promise 3 and turn
-// this flag into memory corruption rather than a slowdown.
+// SenderPort satisfies this structurally -- one pool, one segment, and copies
+// rather than clones on fan-out. That last one is load-bearing: indirect mbufs
+// would break the promise and make this flag memory corruption, not a slowdown.
 inline bool supports_mbuf_fast_free(const rte_eth_dev_info& info) {
   return (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) != 0;
 }
@@ -212,17 +202,12 @@ inline void configure_device(uint16_t port_id, uint16_t nb_rxq, uint16_t nb_txq,
   }
 }
 
-// Checks the descriptor counts the caller asked for against the device, and
-// refuses to run on a mismatch rather than quietly using a different number --
-// ring depth changes the tail, so it must not be substituted behind our back.
+// Refuses to run on a mismatch rather than quietly using a different number:
+// ring depth changes the tail and must not be substituted behind our back.
 //
-// A null pointer means "this direction has no queues": rte_eth_dev_adjust_nb_
-// rx_tx_desc accepts NULL and skips that side, so a TX-only port is not
-// measured against an RX limit it will never touch. That is not cosmetic. The
-// call clamps whatever it is given up to the device minimum, so a sender
-// passing a placeholder RX count would abort here over descriptors it never
-// allocates, on a card whose rx_desc_lim.nb_min happens to exceed the
-// placeholder.
+// A null pointer means "no queues this direction" -- the DPDK call accepts NULL
+// and skips that side, so a TX-only port is not aborted over an RX minimum it
+// never allocates against.
 inline void adjust_descriptor_counts_strong(uint16_t port_id, uint16_t* nb_rxd,
                                       uint16_t* nb_txd) {
   const uint16_t wanted_rxd = nb_rxd ? *nb_rxd : 0;
@@ -303,12 +288,9 @@ inline rte_ether_addr read_mac_address(uint16_t port_id) {
 // Same sequence for both port classes -- this is the checklist, each step
 // is one named function above. Order matters: mempool before configure,
 // configure before queue setup, queue setup before start.
-// How many queues we actually get. Clamped to what the device offers rather
-// than treated as an error, because that number is a property of the instance
-// and not of the configuration: an ENA .large gives one TX queue, a bigger
-// instance gives several. The same binary has to run on whatever size the run
-// lands on, so the caller adapts (the sender shares queues between
-// destinations) instead of refusing to start. Never silent.
+// Clamped rather than an error: queue count is a property of the instance size,
+// not of the configuration, so the caller adapts instead of refusing to start.
+// Never silent.
 inline uint16_t clamp_queues(const char* dir, uint16_t wanted, uint16_t avail) {
   if (wanted <= avail) return wanted;
   std::fprintf(stderr,
@@ -318,19 +300,12 @@ inline uint16_t clamp_queues(const char* dir, uint16_t wanted, uint16_t avail) {
   return avail;
 }
 
-// Brings the port up. Each direction is described by a pair -- how many queues,
-// and how deep each one is -- and a queue count of zero means the port does not
-// do that direction at all: no descriptors are requested for it, no limit of
-// the device is checked against it, and no queue is created.
+// Each direction is a pair -- how many queues, how deep -- and a count of zero
+// means the port does not do that direction at all: no descriptors requested,
+// no device limit checked, no queue created.
 //
-// That is why the counts are parameters rather than the booleans they used to
-// be. A TX-only sender previously still had to name an RX descriptor count it
-// would never allocate, which was not merely noise: the strict descriptor check
-// compared that placeholder against the card's RX minimum and could abort the
-// sender over a ring it does not have.
-//
-// Order matters and is the checklist below: mempool before configure, configure
-// before queue setup, queue setup before start.
+// Order matters: mempool before configure, configure before queue setup, queue
+// setup before start.
 inline BringUp bring_up(const std::string& pool_name, uint32_t nb_mbufs,
                          uint32_t cache_size,
                          uint16_t wanted_rxq, uint16_t nb_rxd,
@@ -465,22 +440,14 @@ inline void print_port_stats(uint16_t port_id) {
 // ---------------------------------------------------------------------
 // SenderPort -- TX-only DPDK port + mempool + a table of destinations.
 //
-// Fan-out lives here rather than in the caller, because the only thing that
-// differs between receivers is the 42 bytes of Ethernet/IPv4/UDP in front of an
-// otherwise identical payload. Each destination therefore owns a prebuilt
-// header template, and replicating a frame is: copy the template, patch the
-// three length/checksum fields that depend on this particular payload, copy the
-// payload. No mbuf cloning -- see the note on replicate() for why.
+// Receivers differ only in the 42 bytes of header in front of an identical
+// payload, so each destination owns a prebuilt header template and replication
+// is: copy template, patch the three per-packet fields, copy payload.
 //
-// Each destination is also assigned a TX queue (`d % n_queues`). When the device
-// offers at least one queue per receiver, that is a queue each, and the ordering
-// between receivers becomes a hardware arbitration property rather than a
-// consequence of the order we happened to enqueue in. When it offers fewer (a
-// smaller instance size offers fewer), destinations share, and the caller is
-// expected to interleave by message so no receiver sits behind another's whole
-// burst. ENA advertises its queue count per instance size -- `ethtool -l`,
-// "Combined" under Pre-set maximums -- so this is read off the machine, not
-// configured.
+// Each destination also gets a TX queue (`d % n_queues`). One queue per receiver
+// makes inter-receiver ordering a hardware property; when the instance offers
+// fewer, destinations share and the caller interleaves by message so no receiver
+// waits behind another's whole burst.
 // ---------------------------------------------------------------------
 class SenderPort {
  public:
@@ -610,22 +577,13 @@ class SenderPort {
   // The fan-out step: `src` already holds a finalized packet for destination 0,
   // `dst` becomes the same payload addressed to `dest_idx`.
   //
-  // This copies the payload rather than sharing it through an indirect mbuf, and
-  // that is deliberate. At this frame size (<=176 bytes, three cache lines, and
-  // hot in L1 because we wrote it a moment ago) the copy costs less than the
-  // atomic refcount increment and decrement a clone would add. The decisive
-  // reason is not the cost, though: a clone makes the mbuf segmented, and a
-  // segmented packet no longer fits ENA's large-LLQ inline entry. Losing that
-  // means the NIC goes back to DMA-reading the body out of host memory, which
-  // is the single round trip this whole design exists to avoid.
+  // Copies rather than clones. A clone would segment the mbuf, and a segmented
+  // packet no longer fits ENA's large-LLQ inline entry -- the NIC would go back
+  // to DMA-reading the body, which is the round trip this design exists to avoid.
   //
-  // The copy is a fixed kFrameCap bytes rather than payload_len. The three
-  // message types are 80, 96 and 176 bytes, so a length-driven copy is an
-  // indirect call into memcpy with an unpredictable size; a constant size is
-  // inlined into three 64-byte vector moves with no branch. The surplus bytes
-  // are never transmitted -- data_len is set from payload_len -- and both
-  // buffers have room for them, since kHeaderLen + kFrameCap is asserted to fit
-  // the mbuf dataroom above.
+  // Fixed kFrameCap, not payload_len: a constant size inlines to vector moves,
+  // a variable one is a call into memcpy. The surplus is never transmitted --
+  // data_len comes from payload_len.
   void replicate(const rte_mbuf* src, rte_mbuf* dst, uint32_t dest_idx,
                  uint16_t payload_len) const {
     std::memcpy(payload_ptr(dst), payload_ptr(src), shm::kFrameCap);
@@ -648,13 +606,9 @@ class SenderPort {
     uint16_t sent = 0;
   };
 
-  // Drains every queue, and does one pass over all of them before retrying any.
-  //
-  // The ordering matters for exactly the metric this transport is judged on. A
-  // per-queue send_with_retry() would spin up to tx_spins_ on queue 0 while
-  // queue 1's packets have not been handed to the NIC at all, so a receiver whose
-  // queue sorts later pays for a transient full ring on a queue that is not even
-  // its own. Round-robin means a full ring delays only its own receiver.
+  // One pass over every queue before retrying any. A per-queue retry loop would
+  // spin on queue 0 while queue 1's packets sit unsent, making one receiver pay
+  // for a full ring that is not even its own.
   void send_all(QueueBatch* batches, uint16_t n_batches) const noexcept {
     uint32_t spins = 0;
     for (;;) {

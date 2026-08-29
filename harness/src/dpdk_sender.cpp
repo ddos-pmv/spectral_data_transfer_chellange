@@ -2,26 +2,15 @@
 // transmits each one as a raw UDP/IPv4/Ethernet packet to every receiver in
 // the destination table.
 //
-// Fan-out is source replication, and that is a property of the fabric rather
-// than a choice: a VPC does not forward IP multicast between instances, so one
-// packet cannot reach N receivers there. The destination table is written so
-// that the same binary does the other thing wherever the fabric allows it --
-// a single row holding a group MAC/address is a genuine multicast send, and
-// then packet rate stops depending on the receiver count. With N unicast rows
-// the sender pays N packets per message, and the ceiling that implies is the
-// thing to measure (see --dest below and the per-queue counters at exit).
+// Fan-out is source replication because a VPC does not forward IP multicast
+// between instances. The destination table is written so one row holding a group
+// address is a genuine multicast send wherever the fabric does replicate; with N
+// unicast rows the sender pays N packets per message, and that ceiling is what
+// the per-queue counters at exit are for.
 //
-// One thread throughout. Replication multiplies the per-packet cost (a header
-// template copy plus a 176-byte payload copy out of L1, tens of nanoseconds)
-// but not the per-burst cost: the shm ring is read once per message no matter
-// how many receivers there are, and each TX queue is still kicked once per
-// burst. A second core would not reduce the packet count, which is what the
-// NIC's allowance actually limits.
-//
-// Each destination gets its own TX queue where the instance offers enough of
-// them; where it does not (an ENA .large has one), destinations share a queue
-// and their packets are interleaved by message, so no receiver waits behind
-// another receiver's entire burst.
+// One thread. Replication multiplies the per-packet cost but not the per-burst
+// cost: the shm ring is read once per message however many receivers there are.
+// A second core would not reduce the packet count, which is the actual limit.
 //
 // Never auto-exits on idle: it is transport infrastructure, not a
 // reporting tool. Stop it with Ctrl+C / SIGTERM.
@@ -32,10 +21,9 @@
 //               [--src-port P] [--burst N] [--mbufs N] [--txd N] [--count N]
 //               [--tx-queues N] [--tx-spins N]
 //
-// --tx-queues caps the queue count (default: one per destination, as many as
-// the device allows). Setting it to 1 puts every receiver on a single queue,
-// which is the comparison that says whether a queue per receiver was worth it
-// on an instance that has them.
+// --tx-queues caps the queue count (default: one per destination). Setting it to
+// 1 puts every receiver on one queue -- the comparison that says whether a queue
+// per receiver was worth it.
 #include <rte_eal.h>
 #include <rte_mbuf.h>
 
@@ -183,9 +171,9 @@ Config parse_args(int argc, char** argv) {
   return c;
 }
 
-// The mbuf budget, checked at startup rather than discovered as alloc_fail
-// halfway through a run. We hold n_dests * burst mbufs of our own at all times,
-// and every TX queue can have a full ring of them awaiting reclaim by the PMD.
+// Checked at startup rather than discovered as alloc_fail mid-run: we hold
+// n_dests * burst mbufs, and every TX queue can have a full ring awaiting
+// reclaim.
 void check_mempool_size(const Config& cfg, uint32_t n_dests, uint16_t n_queues) {
   const uint64_t held = static_cast<uint64_t>(n_dests) * cfg.burst;
   const uint64_t in_flight = static_cast<uint64_t>(n_queues) * cfg.txd;
@@ -203,10 +191,9 @@ void check_mempool_size(const Config& cfg, uint32_t n_dests, uint16_t n_queues) 
   }
 }
 
-// Per-destination mbuf reservoirs. bufs[d][i] is destination d's packet for the
-// i-th message of the current burst, so a destination's packets are already
-// contiguous -- which is what lets the common case (a queue to itself) hand its
-// array straight to tx_burst with no gather at all.
+// bufs[d][i] is destination d's packet for message i, so a destination's packets
+// are contiguous and the common case (a queue to itself) hands its array
+// straight to tx_burst with no gather.
 rte_mbuf* g_bufs[kMaxDests][kMaxBurst];
 
 // Scratch for the shared-queue case only: destinations that share a queue are

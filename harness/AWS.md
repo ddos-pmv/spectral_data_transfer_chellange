@@ -32,9 +32,8 @@
 работает LLQ. Ровно поэтому нужна **вторая ENI**: отвязать ту, на которой висит
 SSH, значит потерять доступ к машине.
 
-Без AWS то же самое поднимается локально на паре `veth` с драйвером `net_af_xdp`
-вместо `net_ena` — код транспорта при этом не меняется, меняется только аргумент
-EAL.
+Решение рассчитано на ENA и только на ENA: путь пакета, ради которого оно
+написано, — inline-запись в память карты через large LLQ, и её нечем заменить.
 
 ---
 
@@ -137,8 +136,41 @@ aws ec2 describe-network-interfaces --network-interface-ids $ENI \
     --query 'NetworkInterfaces[].{MAC:MacAddress,IP:PrivateIpAddress}' --output table
 ```
 
-MAC и IP из последней команды — это то, что пойдёт в `PEER_MAC`, `DST_IP` и
+MAC и IP из последней команды — это то, что пойдёт в `PEER_MAC`, `PEER_IP` и
 `SRC_IP`. Запишите их сразу: после привязки к DPDK карта пропадёт из `ip a`.
+
+### 1.1 Измеренные пределы стенда
+
+Два инстанса `m7i.xlarge`, одна подсеть, одна AZ, трафик по второй ENI.
+
+| | значение | чем измерено |
+|---|---|---|
+| полоса, пик | 12.4 Гбит/с | `iperf3 -P 2`, 10 с |
+| полоса, устойчиво | ≥ 2.25 Гбит/с | `tx.sh`, 150 с без деградации |
+| пакеты | **1 000 000 pps** | `tx.sh`, 150 с |
+
+Потолок PPS **не зависит от размера пакета**: 72-байтные и 216-байтные
+сообщения дают 998 550 и 998 563 pps — разница в пределах шума. Значит
+ограничивают именно пакеты, а не байты.
+
+Следствие для проектирования: на потолке PPS расходуется лишь ~18% доступной
+полосы. Байты дёшевы, пакеты дороги — поэтому несколько сообщений в одной
+UDP-датаграмме умножают пропускную способность по сообщениям. Паковать нужно
+**только уже накопленное в кольце, никогда не выжидая**: на рабочем темпе в
+кольце почти всегда одно сообщение (`avg_burst` порядка 0.01), упаковка не
+срабатывает и на задержку не влияет, а включается сама, когда отправитель
+начинает отставать.
+
+Бюджет получателей при 200k сообщений/с: `1 000 000 / 200 000 = 5` без
+упаковки, `5 × M` с упаковкой по `M`.
+
+Проверять потолок так (`timeout` захватывает и инициализацию EAL, поэтому
+реальный pps чуть выше расчётного):
+
+```bash
+timeout -s INT 150 sudo RATE=1000000 TYPE=book ./scripts/tx.sh
+# pps = sent / 150; ненулевой tx_dropped = упёрлись в шейпер
+```
 
 ---
 
@@ -161,7 +193,6 @@ sudo ./scripts/build.sh
 
 ```bash
 sudo DPDK_VER=v25.11.2 ./scripts/build.sh
-sudo WITH_IGB_UIO=0 ./scripts/build.sh     # без igb_uio (только локальный стенд)
 ```
 
 ### 2.1 Настройка машины
@@ -214,8 +245,6 @@ sudo apt update
 sudo apt install -y build-essential git pkg-config meson ninja-build \
      python3-pyelftools libnuma-dev ethtool chrony \
      linux-headers-$(uname -r) linux-tools-$(uname -r) linux-tools-common
-# для локального стенда на veth (AF_XDP):
-sudo apt install -y libbpf-dev libxdp-dev
 ```
 
 ### 3.2 Сборка DPDK
@@ -235,12 +264,12 @@ sudo ninja -C build install
 
 ```bash
 meson setup build --prefix=/usr/local -Dplatform=native -Dbuildtype=release \
-      -Denable_drivers=net/ena,net/af_xdp,net/null -Dtests=false
+      -Denable_drivers=net/ena -Dtests=false
 ninja -C build -j2
 ```
 
 **`ldconfig` обязателен, а не «на всякий случай».** DPDK линкуется динамически, и
-драйверы (`net_ena`, `net_af_xdp`) живут отдельными `.so` в `pmds-26.0/`, которые EAL
+драйвер `net_ena` живёт отдельным `.so` в `pmds-26.0/`, которые EAL
 подгружает через `dlopen` уже в рантайме. Если каталог не в кэше линковщика, EAL
 молча не найдёт ни одного драйвера и вы получите «no available ethernet devices».
 
@@ -253,7 +282,7 @@ sudo ldconfig
 
 ```bash
 pkg-config --modversion libdpdk                       # 25.11.x
-ls /usr/local/lib/x86_64-linux-gnu/dpdk/pmds-26.0/ | grep -E 'ena|af_xdp'
+ls /usr/local/lib/x86_64-linux-gnu/dpdk/pmds-26.0/ | grep ena
 ```
 
 ### 3.3 Про драйвер ENA и репозиторий amzn-drivers
@@ -490,20 +519,7 @@ sudo ./bin/dpdk_probe -l 0 --vdev net_null0,no-rx=1
 
 ---
 
-## 7. Локальный стенд без AWS
-
-Весь код отлаживается на одной машине: вместо сети между половинами цепочки
-ставится **veth-пара**, а поверх её концов вместо `net_ena` поднимается
-`net_af_xdp`. Аргумент EAL становится
-`--vdev net_af_xdp0,iface=veth-rx,start_queue=0,queue_count=1`, всё остальное —
-как на AWS. Команды поднятия стенда — в шапке `scripts/dpdk_local_bench.toml`.
-
-Числа с такого стенда с AWS не сравнимы: AF_XDP на veth работает в copy-режиме,
-и путь пакета там принципиально другой.
-
----
-
-## 8. ENA PMD: привязка карты
+## 7. ENA PMD: привязка карты
 
 Делается **только на второй ENI**. Первая остаётся ядру и держит SSH.
 
@@ -619,12 +635,12 @@ sudo cat /sys/kernel/debug/x86/pat_memtype_list | grep fe900000
 Теми же скриптами, через подмену устройства EAL:
 
 ```bash
-# инстанс B — напечатает PEER_MAC и DST_IP второй ENI, взять их для tx.sh
+# инстанс B — напечатает PEER_MAC и PEER_IP второй ENI, взять их для tx.sh
 sudo EAL_DEV="-a 0000:28:00.0" ./scripts/rx.sh
 
 # инстанс A
 sudo EAL_DEV="-a 0000:28:00.0" \
-     PEER_MAC=<MAC второй ENI на B> DST_IP=<IP второй ENI на B> ./scripts/tx.sh
+     PEER_MAC=<MAC второй ENI на B> PEER_IP=<IP второй ENI на B> ./scripts/tx.sh
 ```
 
 PCI-адрес свой на каждой машине — берите из `dpdk-devbind.py --status`.
@@ -683,7 +699,7 @@ sudo ./scripts/host.sh apply
 
 ---
 
-## 9. Что должно получиться и как понять, что что-то не так
+## 8. Что должно получиться и как понять, что что-то не так
 
 `consumer` печатает распределение задержки, `dpdk_sender` и `dpdk_reciever` — свои
 счётчики. Смотреть в первую очередь на них:
@@ -709,7 +725,7 @@ sudo ./scripts/host.sh apply
 
 1. UDP 40001 не открыт **в той SG, что висит на второй ENI** — группы привязаны к
    интерфейсу, а не к инстансу;
-2. `PEER_MAC` / `DST_IP` взяты с первичного интерфейса, а не с той ENI, которую
+2. `PEER_MAC` / `PEER_IP` взяты с первичного интерфейса, а не с той ENI, которую
    слушает DPDK (в режиме А `ip a` её уже не показывает — адреса берутся из
    метаданных, см. `scripts/lib.sh`);
 3. пакеты зарезаны anti-spoofing'ом из-за неверного `SRC_IP`;
@@ -735,7 +751,7 @@ Combined:    1        ← максимум, а не текущее значен�
 использует вовсе.
 
 **`vdev_probe(): failed to initialize net_null0`.** У `net_null` свой набор devargs —
-только `size`, `copy`, `no-rx`. Обычно это остаток от строки `net_af_xdp`, которую
+только `size`, `copy`, `no-rx`. Обычно это остаток от строки `--vdev`, которую
 поправили не целиком.
 
 **`no available ethernet devices`.** EAL не нашёл драйвер — почти всегда забытый
@@ -757,7 +773,7 @@ root.
 
 ---
 
-## 10. Сводка того, что настраивается, и зачем
+## 9. Сводка того, что настраивается, и зачем
 
 Для отчёта и для быстрой сверки на новой машине:
 
@@ -771,7 +787,6 @@ root.
 | THP=madvise | остановки процесса от `khugepaged` |
 | LLQ (ENA PMD, включён по умолчанию) | лишний DMA-round-trip на отправке |
 | `igb_uio wc_activate=1` | без Write Combining LLQ замедляет, а не ускоряет |
-| `ethtool -K tx off rx off` (veth) | фиктивные контрольные суммы на стенде |
 | вторая ENI под DPDK | режим А без потери SSH |
 | `ThreadsPerCore=1` (CPU options) | соседи по SMT в L1 горячего процесса |
 | PTP через `/dev/ptp0` + chrony | корректность самого измерения |

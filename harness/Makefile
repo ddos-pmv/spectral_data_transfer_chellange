@@ -5,7 +5,8 @@ CXXFLAGS ?= -std=c++17 -O3 -march=native -g -fno-omit-frame-pointer -Wall -Wextr
 LDLIBS   ?= -lrt -lpthread
 
 BIN := bin
-BINARIES := $(BIN)/producer $(BIN)/consumer $(BIN)/sender $(BIN)/receiver
+BINARIES := $(BIN)/producer $(BIN)/consumer $(BIN)/sender $(BIN)/receiver \
+            $(BIN)/clock_probe
 
 # DPDK-транспорт собирается, только если в системе есть libdpdk: на машине без
 # него `make` должен по-прежнему давать рабочий UDP-baseline, а не падать.
@@ -33,6 +34,12 @@ $(BIN)/producer: src/producer.cpp include/*.h | $(BIN)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
 
 $(BIN)/consumer: src/consumer.cpp include/*.h | $(BIN)
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
+
+# Смещение часов между хостами: четыре метки, круг и разворот считаются каждый
+# на своих часах, поэтому величина не зависит от их согласования. Обычные
+# сокеты, DPDK не нужен -- собирается всегда.
+$(BIN)/clock_probe: src/clock_probe.cpp include/*.h | $(BIN)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
 
 # Динамическая линковка намеренно: драйверы (net_af_xdp, net_ena) живут
