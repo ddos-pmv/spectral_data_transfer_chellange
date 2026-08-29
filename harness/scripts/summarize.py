@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
-"""Перцентили по CSV из consumer'а, с необязательной коррекцией часов.
+"""Перцентили по CSV из consumer'а.
 
     ./scripts/summarize.py results/rx-*/latencies.csv
-    ./scripts/summarize.py latencies.csv --offset-before 18608 --offset-after -1335
+    ./scripts/summarize.py results/rx-*/latencies.csv --offset -12222
+    ./scripts/summarize.py results/rx-*/latencies.csv --offset -12222 --offset-end -12261
 
 Отрезки:
     a = tx_ts - send_ts    кольцо -> отправитель   одни часы, точен
     b = rx_ts - tx_ts      провод                  РАЗНЫЕ часы
     c = recv_ts - rx_ts    приёмник -> consumer    одни часы, точен
 
-b равен настоящему времени провода плюс смещение между хостами, поэтому
-абсолютные e2e и b без коррекции недостоверны. a и c достоверны всегда.
+b равен настоящему времени провода плюс смещение между хостами, поэтому без
+--offset абсолютные b и e2e недостоверны. a и c достоверны всегда.
+
+--offset берётся из clock-probe-start-tx.sh перед прогоном, --offset-end из
+clock-probe-end-tx.sh после. С обоими смещение снимается линейной интерполяцией
+по времени каждого отсчёта, с одним -- как константа.
+
+И то и другое законно только при ОСТАНОВЛЕННОМ chrony: тогда часы расходятся
+линейно, а его поправки каждые 2 с делают смещение непредсказуемым. Мерить надо
+для каждого прогона -- между прогонами смещение уходит заметно (6.4 мкс за шесть
+минут, 0.018 ppm).
+
+Константы хватает, пока уход за прогон мал против измеряемого: на 13 с это
+39..675 нс при b порядка 17 мкс. На многоминутном прогоне накопится микросекунды,
+и тогда нужен --offset-end.
 
 Несколько файлов объединяются в ОДНУ выборку, а не усредняются по файлам:
 перцентиль от N*M отсчётов и медиана из N перцентилей -- разные величины, и на
-дальнем хвосте расходятся в разы, потому что усреднение выбрасывает как раз те
-файлы, где лежат редкие события.
+дальнем хвосте расходятся в разы.
 """
 import argparse
 import glob
-import sys
 
 import numpy as np
 
@@ -29,28 +41,25 @@ LEVELS = [("min", None), ("p50", .50), ("p99", .99), ("p99.9", .999),
 
 
 def load(paths):
-    """pandas быстрее на миллионах строк, но его может не быть на стенде."""
     try:
         import pandas as pd
-        frames = [pd.read_csv(p, usecols=COLS) for p in paths]
-        df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+        f = [pd.read_csv(p, usecols=COLS) for p in paths]
+        df = pd.concat(f, ignore_index=True) if len(f) > 1 else f[0]
         return {c: df[c].to_numpy(dtype=np.int64) for c in COLS}
     except ImportError:
+        import csv
         out = {c: [] for c in COLS}
         for p in paths:
-            opener = __import__("gzip").open if p.endswith(".gz") else open
-            with opener(p, "rt") as f:
-                head = f.readline().strip().split(",")
-                idx = [head.index(c) for c in COLS]
-                for line in f:
-                    v = line.split(",")
-                    for c, i in zip(COLS, idx):
-                        out[c].append(int(v[i]))
+            op = __import__("gzip").open if p.endswith(".gz") else open
+            with op(p, "rt", newline="") as fh:
+                for r in csv.DictReader(fh):
+                    for c in COLS:
+                        out[c].append(int(r[c]))
         return {c: np.asarray(v, dtype=np.int64) for c, v in out.items()}
 
 
 def pct(srt, p):
-    """Ранг ближайшего, как в metrics.h -- чтобы числа сходились с выводом consumer."""
+    """Ранг ближайшего, как в metrics.h -- чтобы числа сходились с consumer'ом."""
     n = srt.size
     rank = int(p * n)
     if rank < p * n:
@@ -60,73 +69,66 @@ def pct(srt, p):
 
 def row(name, vals):
     srt = np.sort(vals)
-    cells = []
-    for lbl, p in LEVELS:
-        v = int(srt[0]) if lbl == "min" else int(srt[-1]) if lbl == "max" else pct(srt, p)
-        cells.append(f"{v:>12,}")
-    print(f"  {name:<16}" + "".join(cells))
+    cells = "".join(
+        f"{(int(srt[0]) if l == 'min' else int(srt[-1]) if l == 'max' else pct(srt, p)):>12,}"
+        for l, p in LEVELS)
+    print(f"  {name:<14}{cells}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("csv", nargs="+", help="один или несколько файлов; объединяются в одну выборку")
-    ap.add_argument("--offset-before", type=int, help="offset_ns от clock_probe ДО прогона")
-    ap.add_argument("--offset-after", type=int, help="offset_ns от clock_probe ПОСЛЕ прогона")
-    args = ap.parse_args()
+    ap.add_argument("csv", nargs="+")
+    ap.add_argument("--offset", type=int,
+                    help="смещение часов в нс, из clock-probe-start-tx.sh перед прогоном")
+    ap.add_argument("--offset-end", type=int,
+                    help="смещение после прогона, из clock-probe-end-tx.sh; "
+                         "с ним поправка интерполируется по времени, без него постоянна")
+    a = ap.parse_args()
+    if a.offset_end is not None and a.offset is None:
+        ap.error("--offset-end без --offset")
 
-    paths = sorted({p for pat in args.csv for p in (glob.glob(pat) or [pat])})
+    paths = sorted({p for pat in a.csv for p in (glob.glob(pat) or [pat])})
     d = load(paths)
-    ts, a, b, c = d["send_ts_ns"], d["a_ns"], d["b_ns"], d["c_ns"]
-    n = ts.size
-    t0, t1 = int(ts.min()), int(ts.max())
+    ts, A, B, C = d["send_ts_ns"], d["a_ns"], d["b_ns"], d["c_ns"]
 
-    print(f"файлов       : {len(paths)}" + ("" if len(paths) == 1 else f"  (объединены в одну выборку)"))
     for p in paths:
-        print(f"               {p}")
-    print(f"отсчётов     : {n:,}")
-    print(f"длительность : {(t1 - t0) / 1e9:.1f} с")
-
-    have = args.offset_before is not None and args.offset_after is not None
-    if (args.offset_before is None) != (args.offset_after is None):
-        sys.exit("нужны обе границы: --offset-before и --offset-after")
-
-    if have:
-        span = t1 - t0
-        if span <= 0:
-            sys.exit("все отсчёты с одним send_ts_ns -- прогон слишком короткий")
-        drift = args.offset_after - args.offset_before
-        ppm = drift / span * 1e6
-        print(f"коррекция    : {args.offset_before:,} -> {args.offset_after:,} нс "
-              f"(уход {drift:,} нс = {ppm:.3f} ppm)")
-        if abs(ppm) > 2.0:
-            print("  ВНИМАНИЕ: больше 2 ppm. Для остановленного chrony это много --")
-            print("            проверьте, что он остановлен на ОБЕИХ машинах.")
-        off = args.offset_before + drift * (ts - t0) / span
-        b_cor = np.rint(b - off).astype(np.int64)
+        print(f"  {p}")
+    print(f"  {ts.size:,} отсчётов, {(int(ts.max()) - int(ts.min())) / 1e9:.1f} с")
+    if a.offset is not None:
+        if a.offset_end is None:
+            print(f"  смещение часов: {a.offset:,} нс (постоянное)")
+        else:
+            span = int(ts.max()) - int(ts.min())
+            drift = a.offset_end - a.offset
+            ppm = drift / span * 1e6 if span else 0.0
+            print(f"  смещение часов: {a.offset:,} -> {a.offset_end:,} нс "
+                  f"(уход {drift:+,} нс = {ppm:.3f} ppm)")
+            if abs(ppm) > 2.0:
+                print("  ВНИМАНИЕ: больше 2 ppm -- проверьте, что chrony остановлен на ОБЕИХ машинах.")
     print()
 
-    hdr = "".join(f"{lbl:>12}" for lbl, _ in LEVELS)
-    print(f"  {'':<16}{hdr}")
-    row("a", a)
-    row("c", c)
-    print("  " + "-" * (16 + 12 * len(LEVELS)))
-    row("b", b)
-    row("e2e", a + b + c)
-    if have:
-        print("  " + "-" * (16 + 12 * len(LEVELS)))
-        row("b испр.", b_cor)
-        row("e2e испр.", a + b_cor + c)
-
-    print()
-    bj = b - b.min()
-    row("b_jitter", bj)
-    print("  (b_jitter = b - min(b): постоянное смещение сокращается, коррекция не нужна)")
-
-    if have:
-        neg = int((b_cor < 0).sum())
+    print(f"  {'':<14}" + "".join(f"{l:>12}" for l, _ in LEVELS))
+    row("a", A)
+    row("c", C)
+    print("  " + "-" * (14 + 12 * len(LEVELS)))
+    if a.offset is None:
+        row("b", B)
+        row("e2e", A + B + C)
+        print("\n  b и e2e без --offset несут смещение часов и абсолютными не являются.")
+    else:
+        if a.offset_end is None:
+            off = a.offset
+        else:
+            t0 = int(ts.min())
+            span = int(ts.max()) - t0
+            off = a.offset + (a.offset_end - a.offset) * (ts - t0) / span if span else a.offset
+        Bc = np.rint(B - off).astype(np.int64)
+        row("b", Bc)
+        row("e2e", A + Bc + C)
+        neg = int((Bc < 0).sum())
         if neg:
-            print(f"\n  ВНИМАНИЕ: {neg:,} отсчётов ({neg / n * 100:.2f}%) дали отрицательный b.")
-            print("            Коррекция завышена: часы разъехались не так, как описывает прямая.")
+            print(f"\n  ВНИМАНИЕ: {neg:,} отсчётов ({neg / Bc.size * 100:.2f}%) с отрицательным b --"
+                  f" смещение снято неверно.")
 
 
 if __name__ == "__main__":

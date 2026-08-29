@@ -5,21 +5,24 @@
 
 ## Пайплайн замера
 
-```bash
-# приёмник                                # отправитель
-sudo ./scripts/clock-probe-start-rx.sh
-                                          sudo ./scripts/clock-probe-start-tx.sh
-sudo COUNT=10000000 ./scripts/rx.sh
-                                          sudo RECEIVERS=N RATE=R ./scripts/tx.sh
-sudo ./scripts/clock-probe-end-rx.sh
-                                          sudo ./scripts/clock-probe-end-tx.sh
+**Один раз за сессию** chrony останавливается и обратно не включается — тогда
+часы расходятся линейно и смещение можно снять замерами до и после прогона.
 
-./scripts/summarize.py results/rx-*/latencies.csv \
-    --offset-before A --offset-after B
+```bash
+# приёмник                          # отправитель
+sudo ./scripts/clock-probe-start-rx.sh
+                                    sudo ./scripts/clock-probe-start-tx.sh
+sudo COUNT=10000000 ./scripts/rx.sh
+                                    sudo RECEIVERS=N RATE=R ./scripts/tx.sh
+sudo ./scripts/clock-probe-end-rx.sh
+                                    sudo ./scripts/clock-probe-end-tx.sh
+
+./scripts/summarize.py results/rx-*/latencies.csv --offset A --offset-end B
 ```
 
-`clock-probe-*` останавливает chrony на обеих машинах и снимает смещение до и после
-прогона; со стоящим chrony оно уходит по прямой, и `summarize.py` вычитает его поточечно.
+С обоими флагами поправка интерполируется по времени каждого отсчёта; с одним
+`--offset` — берётся константой, чего хватает на коротких прогонах (уход 0.018 ppm,
+~240 нс за 13 с при b порядка 17 мкс).
 
 ## Стенд
 

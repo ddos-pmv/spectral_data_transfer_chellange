@@ -57,19 +57,26 @@ sudo ./scripts/host.sh apply
 
 ## Замер со снятием смещения часов
 
+**Один раз за сессию** chrony останавливается и обратно не включается — тогда
+часы расходятся линейно и смещение можно снять замерами до и после прогона.
+
 ```bash
 # приёмник                          # отправитель
 sudo ./scripts/clock-probe-start-rx.sh
                                     sudo ./scripts/clock-probe-start-tx.sh
-sudo ./scripts/rx.sh                sudo ./scripts/tx.sh
+sudo ./scripts/rx.sh
+                                    sudo RECEIVERS=N RATE=R ./scripts/tx.sh
 sudo ./scripts/clock-probe-end-rx.sh
                                     sudo ./scripts/clock-probe-end-tx.sh
 
-./scripts/summarize.py results/rx-*/latencies.csv --offset-before A --offset-after B
+./scripts/summarize.py results/rx-*/latencies.csv --offset A --offset-end B
 ```
 
-`clock-probe-*` останавливает chrony на обеих машинах: тогда смещение уходит по
-прямой, и двух замеров хватает, чтобы вычесть его поточечно.
+С обоими флагами поправка интерполируется по времени каждого отсчёта; с одним
+`--offset` — берётся константой, чего хватает на коротких прогонах (уход 0.018 ppm,
+~240 нс за 13 с при b порядка 17 мкс).
+
+Вернуть часы после серии: `sudo systemctl start chrony`.
 
 ## Прочее
 

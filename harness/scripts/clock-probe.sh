@@ -5,17 +5,19 @@
 #   sudo ./scripts/clock-probe-start-tx.sh    отправитель, снять смещение
 #   ... прогон rx.sh + tx.sh ...
 #   sudo ./scripts/clock-probe-end-rx.sh      приёмник, поднять отражатель
-#   sudo ./scripts/clock-probe-end-tx.sh      отправитель, снять смещение
+#   sudo ./scripts/clock-probe-end-tx.sh      отправитель, смещение после прогона
 #
 # Зачем: b = rx_ts - tx_ts снимается разными часами и потому равен настоящему
 # времени провода плюс смещение между хостами. Со СТАНОВЛЕННЫМ chrony частотная
 # поправка остаётся в ядре, контур её больше не дёргает, и смещение уходит по
 # ПРЯМОЙ -- двух замеров хватает, чтобы знать его в любой момент прогона.
-# Коррекция: ./scripts/summarize.py latencies.csv --offset-before A --offset-after B
+# Коррекция: ./scripts/summarize.py latencies.csv --offset <start> [--offset-end <end>]
 #
-# chrony останавливается на ОБЕИХ машинах в фазе start и запускается обратно в
-# фазе end. Если оставить его работающим хоть на одной, смещение перестаёт быть
-# прямой и линейная коррекция даст неверные числа с видом достоверных.
+# chrony останавливается на ОБЕИХ машинах и обратно НЕ включается: он должен
+# стоять всю серию замеров. Тогда часы расходятся линейно и медленно (измерено
+# 0.018 ppm), смещение внутри прогона можно считать постоянным, а между
+# прогонами оно уходит заметно -- поэтому мерить его надо перед КАЖДЫМ.
+# Включить обратно, когда серия закончена: sudo systemctl start chrony
 #
 # Пробник ходит по УПРАВЛЯЮЩЕМУ интерфейсу (ens5), а не по карте под DPDK.
 # Смещение -- свойство пары часов, а не пути, поэтому измерять его можно по
@@ -53,7 +55,7 @@ need_root
 if [ "$PHASE" = start ]; then
   say "Останавливаю chrony"
   systemctl stop chrony || true
-  row chrony "остановлен (вернётся в clock-probe-end-$ROLE.sh)"
+  row chrony "остановлен на всю серию (вернуть: systemctl start chrony)"
 fi
 
 # В выводе пробника "p50=" и число разделены пробелами, поэтому по полям awk их
@@ -82,19 +84,20 @@ else
   OFF=$(parse_offset "$STATE/clock_probe_$PHASE.txt")
 fi
 
-if [ "$PHASE" = end ]; then
-  say "Запускаю chrony обратно"
-  systemctl start chrony || true
-fi
-
 if [ "$ROLE" = tx ]; then
   echo
   say "Смещение ($PHASE)"
   row offset_ns "${OFF:-не разобрал, возьмите из вывода выше}"
-  if [ "$PHASE" = end ] && [ -f "$STATE/clock_probe_start.txt" ]; then
+  if [ "$PHASE" = start ]; then
+    echo
+    echo "   после прогона:"
+    echo "   ./scripts/summarize.py results/rx-.../latencies.csv --offset $OFF"
+  elif [ -f "$STATE/clock_probe_start.txt" ]; then
     BEF=$(parse_offset "$STATE/clock_probe_start.txt")
     echo
+    row "ушло за прогон" "$(( OFF - BEF )) нс"
+    echo
     echo "   ./scripts/summarize.py results/rx-.../latencies.csv \\"
-    echo "       --offset-before $BEF --offset-after $OFF"
+    echo "       --offset $BEF --offset-end $OFF"
   fi
 fi
