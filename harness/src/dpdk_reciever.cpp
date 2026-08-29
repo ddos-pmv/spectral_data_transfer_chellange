@@ -5,6 +5,11 @@
 //
 // Usage:
 //   dpdk_receiver [EAL args] -- --shm NAME --slots N [--port P] [--burst N]
+//                 [--reorder N]
+//
+// --reorder N включает окно переупорядочивания глубиной N кадров (0 = выкл).
+// Нужно только там, где путь переупорядочивает: несколько TX-очередей на одного
+// получателя или L3 с ECMP. На одном пути стоит нуля тактов и не нужно.
 #include <rte_eal.h>
 #include <rte_mbuf.h>
 
@@ -22,6 +27,7 @@
 #include "shm_segment.h"
 #include "util.h"
 #include "delivery.h"
+#include "reorder.h"
 
 namespace {
 
@@ -36,6 +42,7 @@ struct Config {
   uint32_t nb_mbufs = 8191;
   uint32_t cache_size = 256;
   uint16_t rxd = 2048;
+  uint32_t reorder = 0;  // ёмкость окна переупорядочивания; 0 = выключено
 };
 
 Config parse_args(int argc, char** argv) {
@@ -55,6 +62,7 @@ Config parse_args(int argc, char** argv) {
     else if (a == "--burst") c.burst = static_cast<uint16_t>(std::stoul(next()));
     else if (a == "--mbufs") c.nb_mbufs = static_cast<uint32_t>(std::stoul(next()));
     else if (a == "--rxd") c.rxd = static_cast<uint32_t>(std::stoul(next()));
+    else if (a == "--reorder") c.reorder = static_cast<uint32_t>(std::stoul(next()));
     else {
       std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
       std::exit(2);
@@ -121,6 +129,22 @@ int main(int argc, char** argv) {
 
   rte_mbuf* burst[64];
 
+  // Окно переупорядочивания. Кадры паркуются вместе со своими mbuf, поэтому
+  // free() делается поштучно после публикации, а не пачкой в конце burst'а:
+  // придержанный кадр обязан пережить свой burst.
+  reorder::Window window(cfg.reorder);
+  reorder::Frame ready[reorder::kMaxCapacity + 1];
+
+  auto publish_ready = [&](reorder::Frame* fs, uint32_t k) {
+    for (uint32_t j = 0; j < k; ++j) {
+      if (gate.admit(fs[j].seq)) {
+        out.ring.publish(fs[j].payload, fs[j].len);  // единственная копия
+        ++stats.received;
+      }
+      rte_pktmbuf_free(fs[j].m);
+    }
+  };
+
   while (!g_stop) {
     uint16_t n = receiver.receive(burst, cfg.burst);
     // t2, one clock read per burst: every packet in it was already DMA'd
@@ -148,30 +172,37 @@ int main(int argc, char** argv) {
                                                               &payload,
                                                               &payload_len);
 
-      if (status == dpdk::ReceiverPort::ParseStatus::kOk) {
-        if (payload_len >= sizeof(msg::Header) && payload_len <= shm::kFrameCap) {
-          uint64_t seq_id = 0;
-          std::memcpy(&seq_id, payload + offsetof(msg::Header, seq_id), sizeof(seq_id));
-          if (gate.admit(seq_id)) {
-            // The mbuf is ours to write; stamping here rather than after the
-            // copy keeps the ring copy the only copy of the frame.
-            std::memcpy(const_cast<uint8_t*>(payload) +
-                            offsetof(msg::Header, rx_ts_ns),
-                        &rx_ts, sizeof(rx_ts));
-            out.ring.publish(payload, payload_len);  // the one copy on this side
-            ++stats.received;
-          }
-        } else {
-          ++stats.bad_len;
-        }
-      } else if (status == dpdk::ReceiverPort::ParseStatus::kWrongPort) {
-        ++stats.wrong_port;
-      } else {
-        ++stats.non_udp;
+      if (status != dpdk::ReceiverPort::ParseStatus::kOk) {
+        if (status == dpdk::ReceiverPort::ParseStatus::kWrongPort) ++stats.wrong_port;
+        else ++stats.non_udp;
+        rte_pktmbuf_free(burst[i]);
+        continue;
       }
+      if (payload_len < sizeof(msg::Header) || payload_len > shm::kFrameCap) {
+        ++stats.bad_len;
+        rte_pktmbuf_free(burst[i]);
+        continue;
+      }
+
+      reorder::Frame f;
+      f.m = burst[i];
+      f.payload = const_cast<uint8_t*>(payload);
+      f.len = payload_len;
+      std::memcpy(&f.seq, payload + offsetof(msg::Header, seq_id), sizeof(f.seq));
+
+      // Метка приёма ставится ЗДЕСЬ, а не перед публикацией: окно может
+      // придержать кадр до следующего burst'а, и тогда штамп бы соврал на
+      // всё время ожидания, приписав транспорту чужую задержку.
+      std::memcpy(f.payload + offsetof(msg::Header, rx_ts_ns), &rx_ts,
+                  sizeof(rx_ts));
+
+      const uint32_t k = window.offer(f, ready);
+      publish_ready(ready, k);
     }
-    rte_pktmbuf_free_bulk(burst, n);
   }
+
+  // Придержанные кадры не должны пропасть молча.
+  publish_ready(ready, window.drain(ready));
 
   const delivery::MonotonicGate::Stats& gate_stats = gate.stats();
   // До выхода из main: деструктор порта делает dev_stop/close.
@@ -190,7 +221,14 @@ int main(int argc, char** argv) {
                "gate_backstep  : %llu\t(furthest a late frame was behind)\n"
                "gate_gaps      : %llu\t\n"
                "gate_missing   : %llu\t\n"
-               "injected_drops : 0\t\n",
+               "injected_drops : 0\t\n"
+               "reorder_window : %u\t(0 = выключено)\n"
+               "  in_order     : %llu\t(прошло насквозь)\n"
+               "  parked       : %llu\t(придержано до заполнения дыры)\n"
+               "  recovered    : %llu\t(спасено окном -- без него это потери)\n"
+               "  forced       : %llu\t(окно переполнилось, разрыв признан)\n"
+               "  late         : %llu\t(пришло позже отданного, окно не помогло)\n"
+               "  peak         : %u\t(максимальная занятость)\n",
                static_cast<unsigned long long>(stats.received),
                static_cast<unsigned long long>(stats.wrong_port),
                static_cast<unsigned long long>(stats.non_udp),
@@ -201,6 +239,13 @@ int main(int argc, char** argv) {
                static_cast<unsigned long long>(gate_stats.suppressed),
                static_cast<unsigned long long>(gate_stats.max_backstep),
                static_cast<unsigned long long>(gate_stats.gaps),
-               static_cast<unsigned long long>(gate_stats.missing));
+               static_cast<unsigned long long>(gate_stats.missing),
+               cfg.reorder,
+               static_cast<unsigned long long>(window.stats().in_order),
+               static_cast<unsigned long long>(window.stats().parked),
+               static_cast<unsigned long long>(window.stats().recovered),
+               static_cast<unsigned long long>(window.stats().forced),
+               static_cast<unsigned long long>(window.stats().late),
+               window.stats().peak);
   return 0;
 }

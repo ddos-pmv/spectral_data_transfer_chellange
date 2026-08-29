@@ -9,6 +9,11 @@
 #   sudo DROP_PPM=10000 BURST_LEN=64 ./scripts/rx.sh   # 1% потерь пачками по 64
 #   sudo RECEIVER_RXD=2048 ./scripts/rx.sh             # длиннее RX-очередь
 #   sudo CLOCK=0 ./scripts/rx.sh                       # без замера смещения часов
+#   sudo REORDER=32 ./scripts/rx.sh                    # окно переупорядочивания
+#
+# REORDER нужен только там, где путь переупорядочивает: несколько TX-очередей на
+# одного получателя (DEST_QUEUES>1 у отправителя) или L3 с ECMP. На одном пути он
+# не стоит ни такта и не нужен.
 #
 # Размеры RX-очереди и пула mbuf -- RECEIVER_RXD/RECEIVER_MBUFS в host.conf.
 #
@@ -22,6 +27,7 @@ WARMUP=${WARMUP:-20000}       # первые замеры делаются и в
 IDLE_MS=${IDLE_MS:-2000}      # тишина дольше этого = отправитель кончился
 SLOTS=${SLOTS:-1024}
 BURST=${BURST:-32}
+REORDER=${REORDER:-0}         # глубина окна переупорядочивания, 0 = выключено
 MBUFS=${MBUFS:-8191}          # mbuf в пуле приёмника; 2^n-1 -- лучший размер для ring
 DROP_PPM=${DROP_PPM:-0}       # 0 = не ронять; иначе доля потерь, миллионных долей
 BURST_LEN=${BURST_LEN:-1}     # средняя длина пачки потерь, пакетов
@@ -31,6 +37,7 @@ need_uint RECEIVER_RXD "$RECEIVER_RXD" 64 4096
 need_pow2 RECEIVER_RXD "$RECEIVER_RXD"
 need_uint RECEIVER_MBUFS "$RECEIVER_MBUFS" 1024 1048576
 need_uint BURST "$BURST" 1 64
+need_uint REORDER "$REORDER" 0 64
 need_uint SLOTS "$SLOTS" 8 1048576
 need_pow2 SLOTS "$SLOTS"
 check_pool RECEIVER_MBUFS "$RECEIVER_MBUFS" RECEIVER_RXD "$RECEIVER_RXD" "$BURST"
@@ -84,6 +91,7 @@ row порт "udp/$PORT"
 row устройство "$DEV"
 row ядра "приёмник $CPU_RECEIVER, consumer $CPU_CONSUMER"
 row очередь "RX $RECEIVER_RXD дескрипторов, burst $BURST"
+[ "$REORDER" = 0 ] || row переупорядочивание "окно на $REORDER кадров"
 row пул "$RECEIVER_MBUFS mbuf"
 row ждём "$COUNT сообщений, прогрев $WARMUP"
 [ "$DROP_PPM" = 0 ] || row потери "$DROP_PPM ppm пачками по $BURST_LEN"
@@ -95,7 +103,7 @@ taskset -c "$CPU_RECEIVER" setarch -R ./bin/dpdk_reciever \
   -l "$CPU_RECEIVER" --file-prefix rx \
   $DEV \
   -- --shm /fanout_ring_rx --slots "$SLOTS" --port "$PORT" --burst "$BURST" \
-     --mbufs "$RECEIVER_MBUFS" --rxd "$RECEIVER_RXD" \
+     --mbufs "$RECEIVER_MBUFS" --rxd "$RECEIVER_RXD" --reorder "$REORDER" \
      $DROP_ARGS \
   > "$RUN/receiver.log" 2>&1 &
 RECEIVER=$!
