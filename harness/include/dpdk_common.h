@@ -612,18 +612,17 @@ class SenderPort {
   void send_all(QueueBatch* batches, uint16_t n_batches) const noexcept {
     uint32_t spins = 0;
     for (;;) {
-      bool progressed = false, pending = false;
+      bool pending = false;
       for (uint16_t q = 0; q < n_batches; ++q) {
         QueueBatch& b = batches[q];
         if (b.sent >= b.total) continue;
         const uint16_t k = tx_burst(static_cast<uint16_t>(q), b.pkts + b.sent,
                                     static_cast<uint16_t>(b.total - b.sent));
         b.sent = static_cast<uint16_t>(b.sent + k);
-        if (k) progressed = true;
         if (b.sent < b.total) pending = true;
       }
       if (!pending) return;
-      spins = progressed ? 0 : spins + 1;
+      spins += 1;
       if (spins >= tx_spins_) return;
     }
   }

@@ -349,13 +349,6 @@ int main(int argc, char** argv) {
       // of the pool a whole reuse cycle ago, and unlike the source (which this
       // loop rereads n_dests times and which stays in L1) every one of them is
       // a fresh set of lines to take ownership of.
-      //
-      // Prefetching message i+1's copy for destination d while destination d's
-      // copy of message i is being written puts the request a full pass over
-      // the destinations ahead of its use -- hundreds of cycles at any fan-out
-      // worth measuring -- while keeping only four lines in flight at a time,
-      // which is what stops the requests from overrunning the fill buffers.
-      //
       // Only the packet bodies are prefetched, not the mbuf structs: those are
       // already hot, because rte_pktmbuf_alloc_bulk resets every mbuf it hands
       // out and the refill at the bottom of this loop did exactly that.
