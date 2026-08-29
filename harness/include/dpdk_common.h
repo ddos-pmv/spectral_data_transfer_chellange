@@ -559,7 +559,7 @@ class SenderPort {
   SenderPort(SenderPort&&) = delete;
   SenderPort& operator=(SenderPort&&) = delete;
 
-  bool alloc_bulk(rte_mbuf** mbufs, uint32_t count) const noexcept {
+  inline bool alloc_bulk(rte_mbuf** mbufs, uint32_t count) const noexcept {
     if (count == 0) return true;
     return rte_pktmbuf_alloc_bulk(mempool_, mbufs, count) == 0;
   }

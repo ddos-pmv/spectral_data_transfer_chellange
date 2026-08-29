@@ -347,6 +347,14 @@ int main(int argc, char** argv) {
   dpdk::SenderPort::QueueBatch
       batches[kMaxDests * dpdk::SenderPort::kMaxDestQueues];
   const uint16_t spread = sender.queues_per_dest();
+  // Rotates the chunk->queue mapping by one every burst. Without it the spread
+  // is inert at the burst size that actually occurs: when the sender outruns the
+  // producer it reads one message at a time, n is 1, and a static mapping sends
+  // every such burst to the same queue (chunk 0 is empty, chunk 1 holds the
+  // packet) -- the other queue never sees traffic and the run measures nothing.
+  // Rotating makes consecutive single-message bursts alternate queues, which is
+  // what "spread over K queues" was supposed to mean.
+  uint32_t chunk_rot = 0;
 
   dpdk::SenderPort::prefetch_packet(g_bufs[0][0]);
   while (!g_stop && (cfg.count == 0 || msgs < cfg.count)) {
@@ -419,11 +427,13 @@ int main(int argc, char** argv) {
           const uint32_t end = (n * (c + 1)) / spread;
           dpdk::SenderPort::QueueBatch& b = batches[n_batches++];
           b.pkts = g_bufs[d] + off;
-          b.queue_id = static_cast<uint16_t>(base + c);
+          b.queue_id =
+              static_cast<uint16_t>(base + (c + chunk_rot) % spread);
           b.total = static_cast<uint16_t>(end - off);
           b.sent = 0;
         }
       }
+      ++chunk_rot;
       sender.send_all(batches, n_batches);
 
       // Refill per chunk, not per destination: the sent packets are a prefix of
