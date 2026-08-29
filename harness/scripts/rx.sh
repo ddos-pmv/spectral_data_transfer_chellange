@@ -8,6 +8,7 @@
 #   sudo COUNT=3000000 IDLE_MS=60000 ./scripts/rx.sh
 #   sudo DROP_PPM=10000 BURST_LEN=64 ./scripts/rx.sh   # 1% потерь пачками по 64
 #   sudo RECEIVER_RXD=2048 ./scripts/rx.sh             # длиннее RX-очередь
+#   sudo CLOCK=0 ./scripts/rx.sh                       # без замера смещения часов
 #
 # Размеры RX-очереди и пула mbuf -- RECEIVER_RXD/RECEIVER_MBUFS в host.conf.
 #
@@ -48,6 +49,8 @@ else
   bad "IMDS не ответил -- задайте адреса вручную"
 fi
 
+clock_check
+
 RUN=results/rx-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$RUN"
 rm -f /dev/shm/fanout_ring_rx
@@ -62,6 +65,12 @@ cleanup() {
   echo
   echo "статистика приёмника: $RUN/receiver.log"
   tail -n 8 "$RUN/receiver.log"
+
+  # После остановки приёмника, а не до: иначе отражатель крутился бы в
+  # busy-poll рядом с ним. И в cleanup, а не в конце скрипта, чтобы отработал
+  # по Ctrl+C -- отправитель в этот момент как раз снимает второе смещение.
+  echo
+  clock_reflect "после прогона"
 }
 trap cleanup EXIT
 
@@ -79,6 +88,8 @@ row пул "$RECEIVER_MBUFS mbuf"
 row ждём "$COUNT сообщений, прогрев $WARMUP"
 [ "$DROP_PPM" = 0 ] || row потери "$DROP_PPM ppm пачками по $BURST_LEN"
 row логи "$RUN"
+
+clock_reflect "до прогона"
 
 taskset -c "$CPU_RECEIVER" setarch -R ./bin/dpdk_reciever \
   -l "$CPU_RECEIVER" --file-prefix rx \

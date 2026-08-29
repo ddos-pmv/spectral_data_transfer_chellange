@@ -9,6 +9,10 @@
 #   sudo RECEIVERS=2 ./scripts/tx.sh          # только первые 2 из PEERS
 #   sudo COUNT=5000000 ./scripts/tx.sh        # выйти самому, без Ctrl+C
 #   sudo TX_SPINS=1 ./scripts/tx.sh           # не крутиться на полном TX-кольце
+#   sudo CLOCK=0 ./scripts/tx.sh              # без замера смещения часов
+#
+# Замер смещения требует PROBE_PEER в host.conf -- адрес приёмника на
+# управляющем интерфейсе. rx.sh на той стороне поднимает отражатель сам.
 #
 # Размеры TX-очереди и пула mbuf -- SENDER_TXD/SENDER_MBUFS в host.conf.
 #
@@ -73,6 +77,12 @@ check_pool SENDER_MBUFS "$SENDER_MBUFS" SENDER_TXD "$SENDER_TXD" "$BURST" "$NDES
 
 need_root
 [ -x bin/dpdk_sender ] || die "нет bin/dpdk_sender -- make -j\$(nproc)"
+clock_check
+if clock_enabled && [ -z "$PROBE_PEER" ]; then
+  die "PROBE_PEER пуст -- адрес приёмника на управляющем интерфейсе ($MGMT_IFACE).
+   Посмотреть там: ip -4 -o addr show $MGMT_IFACE; вписать в host.conf.
+   Либо CLOCK=0, чтобы не мерить смещение."
+fi
 
 DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind"
 SRC_IP=${SRC_IP:-$(local_ip)}
@@ -90,6 +100,19 @@ RUN=results/tx-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$RUN"
 rm -f /dev/shm/fanout_ring
 
+OFF_BEFORE=
+if clock_enabled; then
+  say "Смещение часов до прогона"
+  OFF_BEFORE=$(clock_probe_once "$RUN/clock.log")
+  [ -n "$OFF_BEFORE" ] || die "не удалось снять смещение -- запущен ли rx.sh
+   на приёмнике? Он поднимает отражатель. См. $RUN/clock.log"
+  row offset "$OFF_BEFORE нс"
+  # Отражатель на той стороне выходит через PROBE_IDLE_S тишины, и только после
+  # этого rx.sh переходит к самому прогону. Ждём его, иначе первые пакеты уйдут
+  # в ещё не поднятый приёмник.
+  sleep $((PROBE_IDLE_S + 2))
+fi
+
 PRODUCER=
 SENDER=
 cleanup() {
@@ -103,6 +126,22 @@ cleanup() {
   echo
   echo "статистика отправителя: $RUN/sender.log"
   tail -n 20 "$RUN/sender.log" 2>/dev/null || true
+
+  # После прогона, а не после wait: останавливают tx.sh обычно по Ctrl+C.
+  if clock_enabled && [ -n "$OFF_BEFORE" ]; then
+    local after
+    after=$(clock_probe_once "$RUN/clock.log")
+    echo
+    say "Смещение часов после прогона"
+    row offset "${after:-?} нс"
+    if [ -n "$after" ]; then
+      row "ушло за прогон" "$(( after - OFF_BEFORE )) нс"
+      echo
+      echo "   на приёмнике:"
+      echo "   ./scripts/summarize.py results/rx-*/latencies.csv \\"
+      echo "       --offset $OFF_BEFORE --offset-end $after"
+    fi
+  fi
 }
 trap cleanup EXIT
 

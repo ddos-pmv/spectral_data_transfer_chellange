@@ -252,3 +252,48 @@ ensure_igb_uio() {
   echo "     затем sudo ./scripts/nic.sh bind"
   return 0
 }
+
+# ------------------------------------------------------ смещение часов
+# Прогон обрамляется замерами смещения: rx.sh поднимает отражатель, tx.sh к нему
+# ходит. Смещение снимается ДО и ПОСЛЕ, потому что при остановленном chrony часы
+# расходятся линейно, и по двум точкам поправка восстанавливается для каждого
+# отсчёта. Отключается CLOCK=0.
+#
+# chrony останавливается и обратно НЕ включается: он должен стоять всю серию,
+# иначе его поправки каждые 2 с делают смещение непредсказуемым.
+# Вернуть после серии: sudo systemctl start chrony
+CLOCK=${CLOCK:-1}
+PROBE=${PROBE:-bin/clock_probe}
+PROBE_PORT=${PROBE_PORT:-51100}
+PROBE_COUNT=${PROBE_COUNT:-20000}
+PROBE_IDLE_S=${PROBE_IDLE_S:-6}    # отражатель ждёт столько без трафика и выходит
+PROBE_PEER=${PROBE_PEER:-}         # tx: адрес приёмника на управляющем интерфейсе
+MGMT_IFACE=${MGMT_IFACE:-ens5}
+
+clock_enabled() { [ "$CLOCK" = 1 ]; }
+
+clock_check() {
+  clock_enabled || return 0
+  [ -x "$PROBE" ] || die "нет $PROBE -- make -j$(nproc)   (или CLOCK=0)"
+  systemctl stop chrony 2>/dev/null || true
+}
+
+# Отражатель (rx). Выходит сам через PROBE_IDLE_S тишины, поэтому вызов
+# блокирующий и ровно на время замера -- во время самого прогона он не крутится.
+clock_reflect() {
+  clock_enabled || return 0
+  local ip
+  ip=$(ip -4 -o addr show "$MGMT_IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  [ -n "$ip" ] || die "не определить адрес $MGMT_IFACE (или CLOCK=0)"
+  row "отражатель $1" "$ip:$PROBE_PORT, выход через ${PROBE_IDLE_S}с тишины"
+  "$PROBE" --reflect --bind "$ip" --port "$PROBE_PORT" --idle-s "$PROBE_IDLE_S" \
+    >/dev/null 2>&1 || true
+}
+
+# Пробник (tx). Печатает смещение в нс на stdout; "p50=" и число разделены
+# пробелами, поэтому по полям awk их не собрать. Минус обязателен.
+clock_probe_once() {
+  "$PROBE" --probe --peer "$PROBE_PEER:$PROBE_PORT" --count "$PROBE_COUNT" 2>&1 \
+    | tee -a "$1" \
+    | sed -nE 's/.*clock offset[[:space:]]+p50=[[:space:]]*(-?[0-9]+).*/\1/p'
+}

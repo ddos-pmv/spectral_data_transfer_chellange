@@ -57,29 +57,27 @@ sudo ./scripts/host.sh apply
 
 ## Замер со снятием смещения часов
 
-**Один раз за сессию** chrony останавливается и обратно не включается — тогда
-часы расходятся линейно и смещение можно снять замерами до и после прогона.
+Замер смещения часов встроен в `rx.sh` и `tx.sh` — отдельных шагов нет.
+Отключается `CLOCK=0`.
 
 ```bash
-# приёмник                          # отправитель
-sudo ./scripts/clock-probe-start-rx.sh
-                                    sudo ./scripts/clock-probe-start-tx.sh
-sudo ./scripts/rx.sh
-                                    sudo RECEIVERS=N RATE=R ./scripts/tx.sh
-sudo ./scripts/clock-probe-end-rx.sh
-                                    sudo ./scripts/clock-probe-end-tx.sh
+# приёмник                              # отправитель
+sudo ./scripts/rx.sh                    sudo RECEIVERS=N RATE=R ./scripts/tx.sh
+```
 
+`tx.sh` в конце печатает готовую строку:
+
+```bash
 ./scripts/summarize.py results/rx-*/latencies.csv --offset A --offset-end B
 ```
 
-С обоими флагами поправка интерполируется по времени каждого отсчёта; с одним
-`--offset` — берётся константой, чего хватает на коротких прогонах (уход 0.018 ppm,
-~240 нс за 13 с при b порядка 17 мкс).
-
-Вернуть часы после серии: `sudo systemctl start chrony`.
+Каждый скрипт обрамляет свой прогон замером: `rx.sh` поднимает отражатель до и
+после, `tx.sh` до и после ходит к нему пробником. chrony останавливается и
+обратно не включается — часы должны расходиться линейно всю серию
+(вернуть: `sudo systemctl start chrony`). Нужен `PROBE_PEER` в `host.conf` —
+адрес приёмника на управляющем интерфейсе.
 
 ## Прочее
 
 `summarize.py` — перцентили по CSV, с необязательной коррекцией часов.
-`clock-probe-{start,end}-{rx,tx}.sh` — смещение часов до и после прогона.
 `fetch-results.sh` — забрать результаты со стенда.
