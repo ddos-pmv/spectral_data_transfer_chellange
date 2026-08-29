@@ -19,11 +19,21 @@
 //   dpdk_sender [EAL args] -- --shm NAME --slots N --src-ip IP
 //               --dest MAC@IP:PORT [--dest ...]
 //               [--src-port P] [--burst N] [--mbufs N] [--txd N] [--count N]
-//               [--tx-queues N] [--tx-spins N]
+//               [--tx-queues N] [--tx-spins N] [--dest-queues K]
 //
 // --tx-queues caps the queue count (default: one per destination). Setting it to
 // 1 puts every receiver on one queue -- the comparison that says whether a queue
 // per receiver was worth it.
+//
+// --dest-queues K goes the other way: it spreads *one* receiver's stream over K
+// queues, to find out whether a single ENA send queue is what caps the packet
+// rate. This is a measurement mode and it knowingly breaks ordering within a
+// receiver's stream -- the queues drain independently, so the receiver's
+// monotonic gate will suppress whatever arrives behind a higher seq_id. Read the
+// rate from the receiver's raw burst counter (avg_burst x bursts), and read
+// gate_suppressed as the amount of reordering the spread caused. It is
+// incompatible with --tx-queues, and it demands the device actually provide
+// n_dests * K queues rather than quietly running with fewer.
 #include <rte_eal.h>
 #include <rte_mbuf.h>
 
@@ -67,6 +77,7 @@ struct Config {
   // tx_desc_lim from the dev_info banner if this needs changing.
   uint16_t txd = 512;
   uint16_t tx_queues = 0;  // 0 = one per destination, capped by the device
+  uint16_t dest_queues = 1;  // TX queues per destination; >1 gives up ordering
   uint32_t tx_spins = dpdk::kDefaultTxSpins;
 
   // Every receiver, in the order given. One receiver is not a special case --
@@ -150,6 +161,7 @@ Config parse_args(int argc, char** argv) {
     else if (a == "--txd") c.txd = static_cast<decltype(c.txd)>(parse_uint("--txd", next(), 65535));
     else if (a == "--tx-queues") c.tx_queues = static_cast<decltype(c.tx_queues)>(parse_uint("--tx-queues", next(), 65535));
     else if (a == "--tx-spins") c.tx_spins = parse_uint("--tx-spins", next(), 1000);
+    else if (a == "--dest-queues") c.dest_queues = static_cast<decltype(c.dest_queues)>(parse_uint("--dest-queues", next(), dpdk::SenderPort::kMaxDestQueues));
     else {
       std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
       std::exit(2);
@@ -164,6 +176,18 @@ Config parse_args(int argc, char** argv) {
   if (c.dests.size() > kMaxDests) {
     std::fprintf(stderr, "too many --dest (%zu), max %u\n", c.dests.size(),
                  kMaxDests);
+    std::exit(2);
+  }
+  if (c.dest_queues == 0) c.dest_queues = 1;
+  // Both flags decide the queue layout, in opposite directions. Honouring one
+  // and ignoring the other would produce a run that does not match its own
+  // command line.
+  if (c.dest_queues > 1 && c.tx_queues != 0) {
+    std::fprintf(stderr,
+                 "--dest-queues %u and --tx-queues %u both set the queue "
+                 "layout; pass only one\n",
+                 static_cast<unsigned>(c.dest_queues),
+                 static_cast<unsigned>(c.tx_queues));
     std::exit(2);
   }
   if (c.burst > kMaxBurst) c.burst = kMaxBurst;
@@ -225,7 +249,7 @@ int main(int argc, char** argv) {
 
   dpdk::SenderPort sender("sender_pool", cfg.nb_mbufs, cfg.cache_size,
                           /*nb_txd=*/cfg.txd, cfg.dests, src_ip_be,
-                          cfg.src_port, cfg.tx_queues);
+                          cfg.src_port, cfg.tx_queues, cfg.dest_queues);
 
   sender.set_tx_spins(cfg.tx_spins);
 
@@ -268,6 +292,13 @@ int main(int argc, char** argv) {
 
   std::fprintf(stderr, "dpdk_sender: shm=%s, %u destination(s) over %u tx queue(s)\n",
                cfg.shm_name.c_str(), n_dests, static_cast<unsigned>(n_queues));
+  if (cfg.dest_queues > 1) {
+    std::fprintf(stderr,
+                 "  spread: %u tx queue(s) per destination -- ordering within a "
+                 "receiver's stream is NOT preserved; measure the rate from the "
+                 "receiver's raw burst counter, not gate_delivered\n",
+                 static_cast<unsigned>(cfg.dest_queues));
+  }
   for (uint32_t d = 0; d < n_dests; ++d) {
     const dpdk::DestSpec& s = sender.dest(d);
     const uint32_t ip = rte_be_to_cpu_32(s.ip_be);
@@ -282,6 +313,12 @@ int main(int argc, char** argv) {
                  (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff,
                  static_cast<unsigned>(s.port),
                  static_cast<unsigned>(sender.queue_of(d)));
+    if (cfg.dest_queues > 1) {
+      std::fprintf(stderr, "          tx queues %u..%u\n",
+                   static_cast<unsigned>(sender.queue_of(d)),
+                   static_cast<unsigned>(sender.queue_of(d) +
+                                          cfg.dest_queues - 1));
+    }
   }
 
 
@@ -305,7 +342,11 @@ int main(int argc, char** argv) {
   }
 
   uint16_t lens[kMaxBurst];
-  dpdk::SenderPort::QueueBatch batches[kMaxDests];
+  // One batch per queue normally; with a destination spread over K queues it is
+  // one per (destination, chunk), which is the larger of the two bounds.
+  dpdk::SenderPort::QueueBatch
+      batches[kMaxDests * dpdk::SenderPort::kMaxDestQueues];
+  const uint16_t spread = sender.queues_per_dest();
 
   dpdk::SenderPort::prefetch_packet(g_bufs[0][0]);
   while (!g_stop && (cfg.count == 0 || msgs < cfg.count)) {
@@ -360,8 +401,53 @@ int main(int argc, char** argv) {
     }
 
     // --- hand every queue its packets --------------------------------------
+    uint16_t n_batches = 0;
+    if (spread > 1) {
+      // Spread mode: destination d's burst is cut into K contiguous chunks, one
+      // per queue. Contiguous rather than round-robin because a chunk is then
+      // still a slice of g_bufs[d] -- no gather, and, more importantly, the
+      // packets a chunk sends stay a prefix of that chunk, which is what the
+      // refill below relies on. Round-robin would scatter the sent packets
+      // across the row and make "sent" no longer describe a prefix of anything.
+      for (uint32_t d = 0; d < n_dests; ++d) {
+        const uint16_t base = sender.queue_of(d);
+        for (uint16_t c = 0; c < spread; ++c) {
+          // (n*c)/spread rather than c*(n/spread): the latter drops the
+          // remainder, silently leaving up to spread-1 packets of every burst
+          // unsent and unaccounted.
+          const uint32_t off = (n * c) / spread;
+          const uint32_t end = (n * (c + 1)) / spread;
+          dpdk::SenderPort::QueueBatch& b = batches[n_batches++];
+          b.pkts = g_bufs[d] + off;
+          b.queue_id = static_cast<uint16_t>(base + c);
+          b.total = static_cast<uint16_t>(end - off);
+          b.sent = 0;
+        }
+      }
+      sender.send_all(batches, n_batches);
+
+      // Refill per chunk, not per destination: the sent packets are a prefix of
+      // each chunk, but their union is not a prefix of the destination's row.
+      bool spread_refill_ok = true;
+      uint16_t bi = 0;
+      for (uint32_t d = 0; d < n_dests; ++d) {
+        for (uint16_t c = 0; c < spread; ++c, ++bi) {
+          const dpdk::SenderPort::QueueBatch& b = batches[bi];
+          dstats[d].sent += b.sent;
+          dstats[d].dropped += b.total - b.sent;
+          if (!sender.alloc_bulk(b.pkts, b.sent)) [[unlikely]] {
+            ++alloc_fail;
+            spread_refill_ok = false;
+          }
+        }
+      }
+      if (!spread_refill_ok) break;
+      continue;
+    }
+
     for (uint16_t q = 0; q < n_queues; ++q) {
       const QueuePlan& p = plans[q];
+      batches[q].queue_id = q;
       if (p.count == 1) {
         // The queue-per-receiver case: already contiguous, nothing to gather.
         batches[q].pkts = g_bufs[p.dests[0]];

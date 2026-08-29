@@ -187,6 +187,7 @@ int main(int argc, char** argv) {
                "avg_burst      : %.2f\t(avg packets in burst)\n"
                "gate_delivered : %llu\t\n"
                "gate_suppressed: %llu\t\n"
+               "gate_backstep  : %llu\t(furthest a late frame was behind)\n"
                "gate_gaps      : %llu\t\n"
                "gate_missing   : %llu\t\n"
                "injected_drops : 0\t\n",
@@ -198,6 +199,7 @@ int main(int argc, char** argv) {
                static_cast<double>(stats.burst_pkts)/static_cast<double>(stats.bursts),
                static_cast<unsigned long long>(gate_stats.delivered),
                static_cast<unsigned long long>(gate_stats.suppressed),
+               static_cast<unsigned long long>(gate_stats.max_backstep),
                static_cast<unsigned long long>(gate_stats.gaps),
                static_cast<unsigned long long>(gate_stats.missing));
   return 0;

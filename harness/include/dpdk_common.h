@@ -448,6 +448,13 @@ inline void print_port_stats(uint16_t port_id) {
 // makes inter-receiver ordering a hardware property; when the instance offers
 // fewer, destinations share and the caller interleaves by message so no receiver
 // waits behind another's whole burst.
+//
+// `queues_per_dest` > 1 inverts that: one receiver is spread over K queues
+// (`d*K .. d*K+K`) to find out whether a single ENA send queue, not the instance,
+// is what caps the packet rate. Queues drain independently, so this deliberately
+// gives up ordering *within* one receiver's stream -- the receiver's monotonic
+// gate will suppress whatever arrives late. It is a measurement mode: read pps
+// from the receiver's raw burst counter, not from what the gate delivered.
 // ---------------------------------------------------------------------
 class SenderPort {
  public:
@@ -455,6 +462,10 @@ class SenderPort {
       sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr) + sizeof(rte_udp_hdr));
 
   static constexpr uint32_t kMaxDests = 16;
+
+  // TX queues one destination may be spread over. Bounded so the caller's batch
+  // array (kMaxDests * kMaxDestQueues entries) stays a fixed size.
+  static constexpr uint16_t kMaxDestQueues = 8;
 
   static_assert(kHeaderLen + shm::kFrameCap <= RTE_MBUF_DEFAULT_DATAROOM, "frame + L2/L3/L4 headers must fit on mbuf");
   static_assert(kHeaderLen + shm::kFrameCap <= 224, "packet must fit ENA large-LLQ inline entry");
@@ -466,15 +477,22 @@ class SenderPort {
   SenderPort(const std::string& pool_name, uint32_t nb_mbufs,
              uint32_t cache_size, uint16_t nb_txd,
              const std::vector<DestSpec>& dests, uint32_t src_ip_be,
-             uint16_t src_port, uint16_t queue_cap = 0)
+             uint16_t src_port, uint16_t queue_cap = 0,
+             uint16_t queues_per_dest = 1)
       : src_ip_be_(src_ip_be), src_port_(src_port) {
     if (dests.empty() || dests.size() > kMaxDests) {
       std::fprintf(stderr, "SenderPort: need 1..%u destinations, got %zu\n",
                    kMaxDests, dests.size());
       std::exit(1);
     }
+    if (queues_per_dest == 0 || queues_per_dest > kMaxDestQueues) {
+      std::fprintf(stderr, "SenderPort: queues_per_dest must be 1..%u, got %u\n",
+                   kMaxDestQueues, queues_per_dest);
+      std::exit(1);
+    }
+    queues_per_dest_ = queues_per_dest;
 
-    uint16_t wanted_txq = static_cast<uint16_t>(dests.size());
+    uint16_t wanted_txq = static_cast<uint16_t>(dests.size() * queues_per_dest);
     if (queue_cap != 0 && queue_cap < wanted_txq) wanted_txq = queue_cap;
 
     // TX only: the sender never receives, so it asks for no RX queues and
@@ -493,9 +511,30 @@ class SenderPort {
     n_dests_ = static_cast<uint32_t>(dests.size());
     owns_port_ = true;
 
+    // A spread that silently collapsed because the device handed back fewer
+    // queues would still run and still print a number, and that number would be
+    // indistinguishable from the one it is supposed to be compared against.
+    // Refuse instead.
+    if (queues_per_dest_ > 1 &&
+        nb_txq_ < static_cast<uint16_t>(n_dests_ * queues_per_dest_)) {
+      std::fprintf(stderr,
+                   "SenderPort: %u dests x %u queues each needs %u TX queues, "
+                   "device gave %u\n",
+                   n_dests_, queues_per_dest_,
+                   static_cast<unsigned>(n_dests_ * queues_per_dest_),
+                   static_cast<unsigned>(nb_txq_));
+      std::exit(1);
+    }
+
     for (uint32_t d = 0; d < n_dests_; ++d) {
       dests_[d].spec = dests[d];
-      dests_[d].queue_id = static_cast<uint16_t>(d % nb_txq_);
+      // Spreading gives destination d the contiguous block starting at d*K; the
+      // unspread case keeps the wrap, which is what lets destinations share a
+      // queue when the device offers fewer than one each.
+      dests_[d].queue_id =
+          queues_per_dest_ > 1
+              ? static_cast<uint16_t>(d * queues_per_dest_)
+              : static_cast<uint16_t>(d % nb_txq_);
       build_header_template(d);
     }
   }
@@ -509,7 +548,10 @@ class SenderPort {
   uint32_t tx_spins() const { return tx_spins_; }
   void set_tx_spins(uint32_t n) { tx_spins_ = n ? n : 1; }
   uint32_t n_dests() const { return n_dests_; }
+  // The first of this destination's queues; it owns
+  // [queue_of(d), queue_of(d) + queues_per_dest()).
   uint16_t queue_of(uint32_t dest_idx) const { return dests_[dest_idx].queue_id; }
+  uint16_t queues_per_dest() const { return queues_per_dest_; }
   const DestSpec& dest(uint32_t dest_idx) const { return dests_[dest_idx].spec; }
 
   SenderPort(const SenderPort&) = delete;
@@ -600,8 +642,12 @@ class SenderPort {
   }
 
   // What the caller hands send_all(): one entry per queue that has packets.
+  // `queue_id` is carried rather than implied by the array index: with a
+  // destination spread over several queues there are more batches than there are
+  // receivers, and more than one batch per receiver.
   struct QueueBatch {
     rte_mbuf** pkts = nullptr;
+    uint16_t queue_id = 0;
     uint16_t total = 0;
     uint16_t sent = 0;
   };
@@ -616,7 +662,7 @@ class SenderPort {
       for (uint16_t q = 0; q < n_batches; ++q) {
         QueueBatch& b = batches[q];
         if (b.sent >= b.total) continue;
-        const uint16_t k = tx_burst(static_cast<uint16_t>(q), b.pkts + b.sent,
+        const uint16_t k = tx_burst(b.queue_id, b.pkts + b.sent,
                                     static_cast<uint16_t>(b.total - b.sent));
         b.sent = static_cast<uint16_t>(b.sent + k);
         if (b.sent < b.total) pending = true;
@@ -725,6 +771,7 @@ class SenderPort {
   Dest dests_[kMaxDests]{};
 
   uint32_t tx_spins_ = kDefaultTxSpins;
+  uint16_t queues_per_dest_ = 1;
 
   bool tx_ip_cksum_offload_ = false;
   bool owns_port_ = false;

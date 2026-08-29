@@ -9,6 +9,12 @@
 #   sudo RECEIVERS=2 ./scripts/tx.sh          # только первые 2 из PEERS
 #   sudo COUNT=5000000 ./scripts/tx.sh        # выйти самому, без Ctrl+C
 #   sudo TX_SPINS=1 ./scripts/tx.sh           # не крутиться на полном TX-кольце
+#   sudo DEST_QUEUES=2 ./scripts/tx.sh        # размазать получателя по 2 TX-очередям
+#
+# DEST_QUEUES>1 -- режим замера: он намеренно ломает порядок внутри потока одного
+# получателя (очереди опустошаются независимо). Скорость смотреть по сырому
+# счётчику приёмника (bursts x avg_burst), НЕ по gate_delivered; величину
+# переупорядочивания -- по gate_suppressed и gate_backstep.
 #   sudo CLOCK=0 ./scripts/tx.sh              # без замера смещения часов
 #
 # Замер смещения требует PROBE_PEER в host.conf -- адрес приёмника на
@@ -31,6 +37,7 @@ SLOTS=${SLOTS:-1024}
 BURST=${BURST:-32}
 COUNT=${COUNT:-0}             # сообщений и выйти; 0 = бесконечно, до Ctrl+C
 TX_SPINS=${TX_SPINS:-10}      # ретраев на полном TX-кольце, прежде чем выбросить
+DEST_QUEUES=${DEST_QUEUES:-1} # TX-очередей на одного получателя; >1 ломает порядок
 
 # Проверяем до need_root: с опечаткой в конфиге незачем даже спрашивать пароль.
 need_uint SENDER_TXD "$SENDER_TXD" 64 4096
@@ -41,6 +48,7 @@ need_uint SLOTS "$SLOTS" 8 1048576
 need_pow2 SLOTS "$SLOTS"
 need_uint COUNT "$COUNT" 0 100000000000
 need_uint TX_SPINS "$TX_SPINS" 1 1000
+need_uint DEST_QUEUES "$DEST_QUEUES" 1 8
 
 # Получатели. Форма адресации ровно одна -- список MAC@IP:PORT; пара
 # PEER_MAC/PEER_IP сворачивается в него здесь же. Дальше ни скрипт, ни сам
@@ -73,7 +81,9 @@ for peer in $PEERS; do
 done
 NDEST=$(( ${#DEST_ARGS[@]} / 2 ))
 
-check_pool SENDER_MBUFS "$SENDER_MBUFS" SENDER_TXD "$SENDER_TXD" "$BURST" "$NDEST"
+# Очередей теперь NDEST*DEST_QUEUES, и дескрипторы держат mbuf по каждой из них.
+check_pool SENDER_MBUFS "$SENDER_MBUFS" SENDER_TXD "$SENDER_TXD" "$BURST" \
+  "$(( NDEST * DEST_QUEUES ))"
 
 need_root
 [ -x bin/dpdk_sender ] || die "нет bin/dpdk_sender -- make -j\$(nproc)"
@@ -153,6 +163,8 @@ row устройство "$DEV"
 row ядра "producer $CPU_PRODUCER, отправитель $CPU_SENDER"
 row темп "$RATE msg/s, тип $TYPE"
 row очередь "TX $SENDER_TXD дескрипторов, burst $BURST, ретраев $TX_SPINS"
+[ "$DEST_QUEUES" = 1 ] || row очередей_на_получателя \
+  "$DEST_QUEUES -- порядок внутри потока НЕ сохраняется"
 row пул "$SENDER_MBUFS mbuf"
 [ "$COUNT" = 0 ] || row остановка "после $COUNT сообщений"
 row логи "$RUN"
@@ -175,6 +187,7 @@ taskset -c "$CPU_SENDER" setarch -R ./bin/dpdk_sender \
   -- --shm /fanout_ring --slots "$SLOTS" \
      --src-ip "$SRC_IP" "${DEST_ARGS[@]}" --burst "$BURST" \
      --mbufs "$SENDER_MBUFS" --txd "$SENDER_TXD" --tx-spins "$TX_SPINS" \
+     --dest-queues "$DEST_QUEUES" \
      "${COUNT_ARG[@]}" \
   > "$RUN/sender.log" 2>&1 &
 SENDER=$!

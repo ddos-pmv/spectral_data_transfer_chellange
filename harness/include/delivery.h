@@ -33,6 +33,13 @@ class MonotonicGate {
   struct Stats {
     uint64_t delivered = 0;
     uint64_t suppressed = 0;   // duplicate or late: seq_id <= what we already sent
+    // How far behind the stream the furthest late frame was, in seq_ids. Zero
+    // when nothing arrived late. This is the number that sizes a reorder window:
+    // a window narrower than this could not have rescued every late frame.
+    // Duplicates land here too (backstep 0 upward), so read it together with the
+    // sender's configuration -- it only means "reordering" when nothing is
+    // being sent twice.
+    uint64_t max_backstep = 0;
     uint64_t gaps = 0;         // how many times the sequence jumped
     uint64_t missing = 0;      // total frames those jumps skipped over
   };
@@ -50,6 +57,8 @@ class MonotonicGate {
     }
     if (seq_id <= last_) {
       ++stats_.suppressed;
+      const uint64_t backstep = last_ - seq_id;
+      if (backstep > stats_.max_backstep) stats_.max_backstep = backstep;
       return false;
     }
     if (seq_id > last_ + 1) {
