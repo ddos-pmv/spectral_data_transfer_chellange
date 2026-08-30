@@ -83,9 +83,19 @@ def main():
     ap.add_argument("--offset-end", type=int,
                     help="смещение после прогона, из вывода tx.sh; "
                          "с ним поправка интерполируется по времени, без него постоянна")
+    ap.add_argument("--offset-at", type=int,
+                    help="момент первого замера, нс эпохи (те же часы, что send_ts_ns)")
+    ap.add_argument("--offset-end-at", type=int,
+                    help="момент второго замера; вместе с --offset-at поправка "
+                         "привязывается к реальным моментам замеров, а не к первому "
+                         "и последнему отсчёту")
     a = ap.parse_args()
     if a.offset_end is not None and a.offset is None:
         ap.error("--offset-end без --offset")
+    if (a.offset_at is None) != (a.offset_end_at is None):
+        ap.error("--offset-at и --offset-end-at задаются только вместе")
+    if a.offset_at is not None and a.offset_end is None:
+        ap.error("--offset-at без --offset-end")
 
     paths = sorted({p for pat in a.csv for p in (glob.glob(pat) or [pat])})
     d = load(paths)
@@ -98,11 +108,16 @@ def main():
         if a.offset_end is None:
             print(f"  смещение часов: {a.offset:,} нс (постоянное)")
         else:
-            span = int(ts.max()) - int(ts.min())
+            span = ((a.offset_end_at - a.offset_at) if a.offset_at is not None
+                    else int(ts.max()) - int(ts.min()))
             drift = a.offset_end - a.offset
             ppm = drift / span * 1e6 if span else 0.0
             print(f"  смещение часов: {a.offset:,} -> {a.offset_end:,} нс "
                   f"(уход {drift:+,} нс = {ppm:.3f} ppm)")
+            if a.offset_at is None:
+                print("  замеры не привязаны ко времени: наклон взят по первому и "
+                      "последнему отсчёту и завышен.\n"
+                      "  tx.sh печатает --offset-at/--offset-end-at -- с ними точнее.")
             if abs(ppm) > 2.0:
                 print("  ВНИМАНИЕ: больше 2 ppm -- проверьте, что chrony остановлен на ОБЕИХ машинах.")
     print()
@@ -119,9 +134,21 @@ def main():
         if a.offset_end is None:
             off = a.offset
         else:
-            t0 = int(ts.min())
-            span = int(ts.max()) - t0
-            off = a.offset + (a.offset_end - a.offset) * (ts - t0) / span if span else a.offset
+            # Опорные точки поправки -- моменты САМИХ замеров, если они известны.
+            # Отсчёты лежат внутри этого отрезка, а не совпадают с ним: между
+            # первым замером и первым отсчётом проходят секунды ожидания и
+            # прогрева, а второй замер снимается уже после прогона -- и тем позже,
+            # чем дальше приёмник в очереди обхода. Привязка к min/max отсчётов
+            # растягивает тот же уход на более короткий отрезок, то есть завышает
+            # наклон; на часах, уходящих быстро, это вычитает на хвосте лишние
+            # микросекунды и загоняет b под ноль.
+            if a.offset_at is not None:
+                t0, t1 = a.offset_at, a.offset_end_at
+            else:
+                t0, t1 = int(ts.min()), int(ts.max())
+            span = t1 - t0
+            off = (a.offset + (a.offset_end - a.offset) * (ts - t0) / span
+                   if span else a.offset)
         Bc = np.rint(B - off).astype(np.int64)
         row("b", Bc)
         row("e2e", A + Bc + C)

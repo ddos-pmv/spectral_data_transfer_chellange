@@ -116,13 +116,15 @@ mkdir -p "$RUN"
 rm -f /dev/shm/fanout_ring
 
 OFF_BEFORE=()
+AT_BEFORE=()
 if clock_enabled; then
   say "Смещение часов до прогона"
   i=0
-  while read -r peer off; do
+  while read -r peer off at; do
     [ -n "$off" ] || die "не удалось снять смещение до $peer -- запущен ли там rx.sh?
    Он поднимает отражатель. См. $RUN/clock.log"
     OFF_BEFORE[$i]=$off
+    AT_BEFORE[$i]=$at
     row "$peer" "$off нс"
     i=$((i + 1))
   done < <(clock_probe_all "$RUN/clock.log" "${PROBE_LIST[@]}")
@@ -151,12 +153,17 @@ cleanup() {
   if clock_enabled && [ "${#OFF_BEFORE[@]}" != 0 ]; then
     echo
     say "Смещение часов после прогона"
-    local i=0 peer after
-    while read -r peer after; do
+    local i=0 peer after at
+    while read -r peer after at; do
       if [ -n "$after" ]; then
         row "$peer" "$after нс, за прогон $(( after - OFF_BEFORE[i] )) нс"
+        # Моменты замеров идут вместе со смещениями: поправка привязывается к ним,
+        # а не растягивается по первому и последнему отсчёту. Иначе наклон завышен
+        # на всё время, что прошло от замера до первого отсчёта и от последнего до
+        # второго замера, -- на быстро уходящих часах это уводит b под ноль.
         echo "      там: ./scripts/summarize.py results/rx-*/latencies.csv \\"
-        echo "           --offset ${OFF_BEFORE[i]} --offset-end $after"
+        echo "           --offset ${OFF_BEFORE[i]} --offset-at ${AT_BEFORE[i]} \\"
+        echo "           --offset-end $after --offset-end-at $at"
       else
         row "$peer" "замер не удался, см. $RUN/clock.log"
       fi
