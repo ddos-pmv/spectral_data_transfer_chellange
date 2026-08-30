@@ -36,6 +36,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -153,7 +154,7 @@ int main(int argc, char** argv) {
   ring.attach(seg.base(), cfg.slots, /*init=*/false);
 
   uint64_t read_index = cfg.from_edge ? ring.live_edge() : 0;
-  uint64_t lapped_events = 0, sent_msgs = 0, sent_pkts = 0;
+  uint64_t lapped_events = 0, sent_msgs = 0, sent_pkts = 0, empty_spins = 0;
 
   const uint32_t B = cfg.batch;
   const size_t N = dst_addrs.size();
@@ -182,6 +183,7 @@ int main(int argc, char** argv) {
         ++lapped_events;
         read_index = resume;
       } else {
+        empty_spins++;
         break;  // kEmpty: nothing more ready right now, flush what we have
       }
     }
@@ -202,6 +204,16 @@ int main(int argc, char** argv) {
       }
     }
 
+    // t1: last thing before the syscall, same placement as the DPDK sender so
+    // segment A means the same thing on both transports.
+    const uint64_t tx_ts = util::now_ns();
+    for (uint32_t i = 0; i < got; ++i) {
+      if (iovs[i].iov_len < sizeof(msg::Header)) continue;
+      std::memcpy(static_cast<uint8_t*>(iovs[i].iov_base) +
+                      offsetof(msg::Header, tx_ts_ns),
+                  &tx_ts, sizeof(tx_ts));
+    }
+
     size_t off = 0;
     while (off < m) {
       int rc = sendmmsg(sock, msgs.data() + off, static_cast<unsigned>(m - off), 0);
@@ -218,8 +230,8 @@ int main(int argc, char** argv) {
   }
 
   fprintf(stderr,
-          "sender: sent %llu messages (%llu packets) to %zu dst(s), lapped %llu\n",
-          (unsigned long long)sent_msgs, (unsigned long long)sent_pkts, N,
+          "sender: sent %llu messages (%llu packets) to %zu dst(s), empty_spins:%llu, lapped %llu\n",
+          (unsigned long long)sent_msgs, (unsigned long long)sent_pkts, N, (unsigned long long)empty_spins,
           (unsigned long long)lapped_events);
   close(sock);
   return 0;

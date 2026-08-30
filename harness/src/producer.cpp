@@ -67,86 +67,101 @@ Config parse_args(int argc, char** argv) {
   return c;
 }
 
-// All messages are BTCUSDT@BINANCE for now -- single-instrument placeholder
-// until symbol/venue get a real out-of-band id<->name dictionary.
-constexpr uint32_t kInstrumentId = 1;
+// Running aggregates over the trade stream. The producer is the right place to
+// compute these: it is the source of truth, so the totals describe every trade that
+// was generated rather than only the ones that happened to be delivered. That is
+// what lets a consumer recover the correct total after a gap.
+struct Totals {
+  uint64_t quantity_lots = 0;
+  uint64_t notional_ticks = 0;
+  uint64_t trade_count = 0;
+};
 
-void fill_header(msg::Header& h, uint64_t seq, msg::Type type,
-                  uint32_t flags_bits) {
+// Venue timestamp offsets. Real feeds show a gap between when the matching engine
+// saw the event and when the gateway published it; these stand in for that.
+inline constexpr int32_t kExchangeLagNs = 4200;
+inline constexpr int32_t kMatchEngineLagNs = 130;
+
+void fill_header(msg::Header& h, uint64_t seq, msg::Type type, uint8_t flags) {
   h.seq_id = seq;
-  h.instrument_id = kInstrumentId;
-  h.flags_and_type = msg::pack_type(type) | flags_bits;
+  h.instrument = 0;
+  h.type = static_cast<uint8_t>(type);
+  h.flags = flags;
+  h.exch_ts_delta_ns = kExchangeLagNs;
+  h.match_ts_delta_ns = kMatchEngineLagNs;
+  h.reserved = 0;
+  // The transport fills these in later; zero them so an unsent frame is not
+  // mistaken for one that already went through the sender.
+  h.tx_ts_ns = 0;
+  h.rx_ts_ns = 0;
   h.send_ts_ns = util::now_ns();  // stamp as late as possible before publish
 }
 
-uint32_t build_trade(void* buf, uint64_t seq) {
+uint32_t build_trade(void* buf, uint64_t seq, Totals* totals) {
   auto& m = *reinterpret_cast<msg::Trade*>(buf);
   m.trade_id = 100000 + seq;
-  m.buyer_order_id = 500000 + seq * 2;
-  m.seller_order_id = 500001 + seq * 2;
-  m.match_engine_ts_ns = util::now_ns();
-  const double price = 65000.0 + static_cast<double>(seq % 500) * 0.5;
-  const double quantity = 0.001 + static_cast<double>(seq % 100) * 0.01;
-  m.price_ticks = static_cast<int64_t>(price * 100.0);
-  m.quantity_lots = static_cast<int64_t>(quantity * 1000.0);
+  m.price_ticks = 6500000 + static_cast<int64_t>(seq % 500) * 50;
+  m.quantity_lots = 1 + static_cast<int64_t>(seq % 100) * 10;
 
-  const uint32_t tick_direction = seq % 4;
-  const uint32_t aggressor_side = seq & 1;
-  const uint32_t flags_bits =
-      (tick_direction << msg::kTradeTickDirectionShift) |
-      (aggressor_side ? msg::kTradeFlagAggressorSide : 0);
-  // is_block_trade / is_rpi / is_liquidation flags exist (kTradeFlag*) but
-  // this synthetic feed never sets them -- left at 0.
-  fill_header(m.header, seq, msg::Type::Trade, flags_bits);
+  totals->quantity_lots += static_cast<uint64_t>(m.quantity_lots);
+  totals->notional_ticks += static_cast<uint64_t>(m.price_ticks) *
+                            static_cast<uint64_t>(m.quantity_lots);
+  ++totals->trade_count;
+  m.cum_quantity_lots = totals->quantity_lots;
+  m.cum_notional_ticks = totals->notional_ticks;
+  m.cum_trade_count = totals->trade_count;
+
+  uint8_t flags = 0;
+  if (seq & 1) flags |= msg::kFlagAggressorSell;
+  flags |= static_cast<uint8_t>((seq % 4) << msg::kTickDirShift);
+  // is_block_trade / is_rpi / is_liquidation flags exist (kFlag*) but this
+  // synthetic feed never sets them -- left at 0.
+  fill_header(m.header, seq, msg::Type::Trade, flags);
   return sizeof(msg::Trade);
 }
 
 uint32_t build_bbo(void* buf, uint64_t seq) {
   auto& m = *reinterpret_cast<msg::Bbo*>(buf);
   m.update_id = 900000 + seq;
-  m.match_engine_ts_ns = util::now_ns();
-  const double mid = 65000.0 + static_cast<double>(seq % 500) * 0.5;
-  const double bid_price = mid - 0.5;
-  const double ask_price = mid + 0.5;
-  const double bid_size = 1.5 + static_cast<double>(seq % 50) * 0.1;
-  const double ask_size = 1.5 + static_cast<double>((seq + 7) % 50) * 0.1;
-  m.bid_price_ticks = static_cast<int64_t>(bid_price * 100.0);
-  m.ask_price_ticks = static_cast<int64_t>(ask_price * 100.0);
-  m.bid_size_lots = static_cast<int64_t>(bid_size * 1000.0);
-  m.ask_size_lots = static_cast<int64_t>(ask_size * 1000.0);
-  m.bid_order_count = 3 + static_cast<uint32_t>(seq % 10);
-  m.ask_order_count = 3 + static_cast<uint32_t>((seq + 3) % 10);
-  fill_header(m.header, seq, msg::Type::Bbo, /*flags_bits=*/0);
+  const int64_t mid_ticks = 6500000 + static_cast<int64_t>(seq % 500) * 50;
+  m.bid_price_ticks = mid_ticks - 50;
+  m.spread_ticks = 100;
+  m.bid_size_lots = static_cast<int32_t>(1500 + (seq % 50) * 100);
+  m.ask_size_lots = static_cast<int32_t>(1500 + ((seq + 7) % 50) * 100);
+  m.bid_order_count = static_cast<uint16_t>(3 + seq % 10);
+  m.ask_order_count = static_cast<uint16_t>(3 + (seq + 3) % 10);
+  fill_header(m.header, seq, msg::Type::Bbo, 0);
   return sizeof(msg::Bbo);
 }
 
 uint32_t build_book(void* buf, uint64_t seq) {
   auto& m = *reinterpret_cast<msg::OrderBook*>(buf);
   m.update_id = 900000 + seq;
-  m.prev_update_id = m.update_id - 1;
-  m.match_engine_ts_ns = util::now_ns();
-  const double mid = 65000.0 + static_cast<double>(seq % 500) * 0.5;
-  for (uint32_t i = 0; i < msg::kBookDepth; ++i) {
-    const double bid_price = mid - 0.5 - static_cast<double>(i);
-    const double bid_size = 1.0 + static_cast<double>((seq + i) % 40) * 0.1;
-    m.bidsLevels.price_ticks[i] = static_cast<int64_t>(bid_price * 100.0);
-    m.bidsLevels.size_lots[i] = static_cast<int64_t>(bid_size * 1000.0);
-    m.bidsLevels.order_count[i] = 2 + static_cast<uint32_t>((seq + i) % 8);
+  m.prev_update_gap = 1;
+  m.reserved = 0;
+  const int64_t mid_ticks = 6500000 + static_cast<int64_t>(seq % 500) * 50;
 
-    const double ask_price = mid + 0.5 + static_cast<double>(i);
-    const double ask_size =
-        1.0 + static_cast<double>((seq + i + 5) % 40) * 0.1;
-    m.asksLevels.price_ticks[i] = static_cast<int64_t>(ask_price * 100.0);
-    m.asksLevels.size_lots[i] = static_cast<int64_t>(ask_size * 1000.0);
-    m.asksLevels.order_count[i] =
-        2 + static_cast<uint32_t>((seq + i + 5) % 8);
+  m.bids.top_price_ticks = mid_ticks - 50;
+  m.asks.top_price_ticks = mid_ticks + 50;
+  m.bids.reserved = 0;
+  m.asks.reserved = 0;
+  for (uint32_t i = 0; i < msg::kBookDepth; ++i) {
+    // Levels below the top are offsets from it: bids step down, asks step up.
+    if (i > 0) {
+      m.bids.price_offset_ticks[i - 1] = -static_cast<int32_t>(i) * 100;
+      m.asks.price_offset_ticks[i - 1] = static_cast<int32_t>(i) * 100;
+    }
+    m.bids.size_lots[i] = static_cast<int32_t>(1000 + ((seq + i) % 40) * 100);
+    m.bids.order_count[i] = static_cast<uint16_t>(2 + (seq + i) % 8);
+    m.asks.size_lots[i] = static_cast<int32_t>(1000 + ((seq + i + 5) % 40) * 100);
+    m.asks.order_count[i] = static_cast<uint16_t>(2 + (seq + i + 5) % 8);
   }
   m.checksum = static_cast<uint32_t>(seq * 2654435761u);
-  fill_header(m.header, seq, msg::Type::OrderBook, msg::kBookFlagSnapshot);
+  fill_header(m.header, seq, msg::Type::OrderBook, msg::kFlagSnapshot);
   return sizeof(msg::OrderBook);
 }
 
-uint32_t build(Kind kind, uint64_t seq, void* buf) {
+uint32_t build(Kind kind, uint64_t seq, void* buf, Totals* totals) {
   Kind k = kind;
   if (k == Kind::Mixed) {
     switch (seq % 3) {
@@ -156,7 +171,7 @@ uint32_t build(Kind kind, uint64_t seq, void* buf) {
     }
   }
   switch (k) {
-    case Kind::Trade: return build_trade(buf, seq);
+    case Kind::Trade: return build_trade(buf, seq, totals);
     case Kind::Bbo: return build_bbo(buf, seq);
     default: return build_book(buf, seq);
   }
@@ -193,6 +208,7 @@ int main(int argc, char** argv) {
           kind_name(cfg.kind));
 
   uint64_t seq = 0;
+  Totals totals;
   while (cfg.count == 0 || seq < cfg.count) {
     if (interval_ns) {
       while (util::now_ns() < next_send) {
@@ -200,7 +216,7 @@ int main(int argc, char** argv) {
       next_send += interval_ns;
     }
     ++seq;
-    const uint32_t len = build(cfg.kind, seq, frame);
+    const uint32_t len = build(cfg.kind, seq, frame, &totals);
     ring.publish(frame, len);
   }
 

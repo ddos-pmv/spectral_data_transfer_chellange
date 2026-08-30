@@ -1,8 +1,20 @@
 aws instances:
 
+What i need to do, before start bench:
+1. taskset
+2. isolcpus kernel boot parametr allows to specify a set of logical cores, wher user-space threads cannot be scheduled 
+3. rcu_nocvs. specify a set of logical cores, which shuldn't run RCU callbacks
+4. nohz_full/ specifies tickless behavior on marked cores
+5. specify core to run IRQ callbacks for every IRQ:
+   - cat /proc/interrupts to map devices to corresponding irq numbers
+   - set a bitmask in  /proc/irq/$irq_num/smp_affinity
+   - disable irqbalancec.service to prevent automatic balancing
+6. split L3 cache
+    - resctrl can be used to split L3 cache between diffenerent processes(cores)
+
 # scripts/bench.py — тот же прогон по TOML-конфигу
 
-`./bench.py [config.toml]` (по умолчанию `scripts/bench.toml`). Флагов нет: всё в конфиге, его копия кладётся рядом с результатами.
+`./bench.py [config.toml]` (по умолчанию `scripts/local_bench.toml`). Флагов нет: всё в конфиге, его копия кладётся рядом с результатами.
 
 Отличия от `start_simple.sh`: ядра задаются явно в конфиге, а не подбираются; есть свипы и `summary.csv`; нет netem и автоподбора ядер.
 
@@ -35,7 +47,7 @@ aws instances:
 | consumer | `--count` | `consumer.count` |
 | | `--warmup` | `consumer.warmup` |
 | | `--csv` | `receiver.csv`, необязательный, по умолчанию автоимя |
-| | `--idle-ms` | нет, дефолт 2000 мс — он же страховка от зависания, своего таймаута у `bench.py` нет |
+| | `--idle-ms` | нет, дефолт 2000 мс — он же страховка от зависания, своего таймаута у `local_bench.py` нет |
 | | `--from-edge` | нет — всегда включён |
 
 Свипуются только `producer.rate` и `bench.fanout`.
@@ -48,7 +60,7 @@ aws instances:
 
 ## Замеры (i7-12650H, loopback, без isolcpus, governor=powersave; count=50000, warmup=5000)
 
-Свип `bench.py`, ядра 2/4 под producer/sender, получатели на 6/10/13, consumer'ы на 8/12/14:
+Свип `local_bench.py`, ядра 2/4 под producer/sender, получатели на 6/10/13, consumer'ы на 8/12/14:
 
 | rate | fanout | drops | p50          | p99          | p99.9      |
 |------|--------|-------|--------------|--------------|------------|
@@ -71,7 +83,39 @@ p50 растёт монотонно с номером получателя (2.4 
 
 - `--loss` / `--delay` (netem) в `start_simple.sh`: код есть, прогона не было — нужен sudo.
 - `--no-pin` в `start_simple.sh`.
+- **VTune из `local_bench.py` убран.** Причина: attach-сбор не завершается ни по `-command stop`, ни по SIGINT,
+  ни по смерти цели (в его `log/` видно `Could not start ContainerMapping collector` — спотыкается о PID
+  namespace), а обход этого стоил скрипту отдельного порядка останова и таймаутов на каждой точке.
+  Рабочий путь — `perf`; если VTune понадобится, его проще навесить руками на уже запущенный прогон
+  (`vtune -collect hotspots -target-pid ...`) и смотреть в `vtune-gui`. `scripts/vtune_setup.sh` остаётся:
+  он выставляет `perf_event_paranoid`/`kptr_restrict`/`ptrace_scope`, которые нужны и самому `perf`.
+- **Трейспоинты недоступны** (`sched:*`, off-CPU, syscalls): tracefs закрыт, `perf` отвечает
+  `can't access trace events`. Нужен root — поэтому off-CPU профилирования в наборе нет.
+- `valgrind`/`cachegrind` на машине не установлены.
 
 ## Прочее
+# DPDK: рост latency при 600-700k (21.08.2026)
 
-`src/sender.cpp:157-158` — мёртвый код `idle_ms` (`idle_ns`, `last_progress` не используются), даёт `-Wunused-variable`.
+Симптом: дропов нет, p50 ×2. Это **не** нехватка ресивера — он бы терял пакеты, а не копил задержку.
+
+- +2630 нс при интервале 1428 нс = очередь меньше двух сообщений. Это батчинг, а не затор.
+- Отправитель (`dpdk_sender.cpp:131`) вычитывает до `--burst` = 32 сообщений **до** `tx_burst`.
+  На 200k кольцо пусто после первого → отправка сразу; на 700k набирается пачка, и первый
+  пакет ждёт, пока оформят остальные (~100 нс на сообщение: memcpy 216 Б + `finalize`).
+- Диагностика: счётчик **avg_burst** (`bursts`, `burst_pkts`) с обеих сторон.
+  ~1.0 у обоих — батчинга нет; растёт у отправителя — виноват он; растёт у ресивера — тогда он.
+  Контроль: прогон 700k с `--burst 4` и `--burst 1`.
+- Вне кода: на veth в copy-режиме сообщение копируется 4 раза (skb → umem → mbuf → слот),
+  а `sendto` из `tx_burst` тащит `veth_xmit` + NAPI пира + XDP-редирект **в softirq на ядре
+  отправителя** (CPU 4). Проверять `mpstat -P 2,4,6,8 1` (%sys) и `perf top -C 4`.
+  На ENA этого слоя нет — домашний потолок по rate к стенду организаторов не относится.
+
+Правки в ресивере (делать в любом случае, помогают и на ENA), по убыванию:
+1. Префетч пакета `i+1` (две линии: 0 и 128) — первое касание mbuf'а это промах.
+2. `rte_pktmbuf_free` → `rte_pktmbuf_free_bulk` после пачки (`dpdk_reciever.cpp:112`).
+   На veth не гейтит приём, в zero-copy на ENA — гейтит.
+3. `Slot.frame` лежит по смещению 12 (`shm_ring.h:25`) → добавить `uint32_t reserved_`,
+   станет 16. `sizeof(Slot)` как было 256, так и останется. Требует сборки всех бинарей
+   из одного дерева; заодно сверять `magic`/`slot_size` в `Ring::attach` у читателей.
+4. `memcpy` с рантайм-длиной (`shm_ring.h:74`) при трёх известных длинах (72/80/216) —
+   только если замер покажет, что копия видна: протаскивает форматы сообщений в кольцо.

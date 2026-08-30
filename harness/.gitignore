@@ -1,5 +1,13 @@
 bin/
-results/
-scripts/latencies.csv
-scripts/.bench_host_state
 cmake*/
+__pycache__/
+
+# результаты прогонов; latencies.csv в них бывает по 30 МБ
+results/
+scripts/*.csv
+
+# состояние конкретной машины: PCI, MAC, адреса -- у каждой свои
+scripts/host.conf
+scripts/.host-state
+sweep/
+sweep-rx.log
