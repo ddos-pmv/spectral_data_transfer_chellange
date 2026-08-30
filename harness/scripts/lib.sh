@@ -276,7 +276,10 @@ PROBE_WAIT_S=${PROBE_WAIT_S:-100}
 # PROBE_PEER -- частный случай на одного; ниже он сворачивается в список.
 PROBE_PEERS=${PROBE_PEERS:-${PROBE_PEER:-}}
 PROBE_PEER=${PROBE_PEER:-}
-MGMT_IFACE=${MGMT_IFACE:-ens5}
+# Управляющий интерфейс. Пусто -- взять тот, через который идёт маршрут по
+# умолчанию: имя зависит от размера инстанса, и зашитый ens5 на c6in.xlarge
+# просто не существует.
+MGMT_IFACE=${MGMT_IFACE:-}
 
 clock_enabled() { [ "$CLOCK" = 1 ]; }
 
@@ -288,11 +291,28 @@ clock_check() {
 
 # Отражатель (rx). Выходит сам через PROBE_IDLE_S тишины, поэтому вызов
 # блокирующий и ровно на время замера -- во время самого прогона он не крутится.
+# Интерфейс, через который уходит маршрут по умолчанию, и его адрес. Ошибки
+# гасятся в "", а не остаются кодом возврата: под `set -e` с `pipefail` упавший
+# `ip` убил бы скрипт прямо на присваивании, не дав напечатать причину -- ровно
+# так молча умирал rx.sh, когда MGMT_IFACE был зашит в несуществующий ens5.
+mgmt_iface() {
+  if [ -n "$MGMT_IFACE" ]; then echo "$MGMT_IFACE"; return 0; fi
+  ip -4 route show default 2>/dev/null | awk '/dev/ {for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true
+}
+
+mgmt_ip() {
+  local iface=$1
+  [ -n "$iface" ] || return 0
+  ip -4 -o addr show "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true
+}
+
 clock_reflect() {
   clock_enabled || return 0
-  local ip
-  ip=$(ip -4 -o addr show "$MGMT_IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-  [ -n "$ip" ] || die "не определить адрес $MGMT_IFACE (или CLOCK=0)"
+  local iface ip
+  iface=$(mgmt_iface)
+  ip=$(mgmt_ip "$iface")
+  [ -n "$ip" ] || die "не определить адрес управляющего интерфейса${iface:+ ($iface)}.
+   Посмотреть: ip -4 -o addr show; задать явно MGMT_IFACE=<имя>, либо CLOCK=0."
   row "отражатель $1" "$ip:$PROBE_PORT, ждёт до ${PROBE_WAIT_S}с, выход через ${PROBE_IDLE_S}с тишины"
   "$PROBE" --reflect --bind "$ip" --port "$PROBE_PORT" \
     --idle-s "$PROBE_IDLE_S" --wait-s "$PROBE_WAIT_S" \

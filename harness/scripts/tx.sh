@@ -82,7 +82,7 @@ NDEST=$(( ${#DEST_ARGS[@]} / 2 ))
 PROBE_LIST=($PROBE_PEERS)
 if clock_enabled; then
   [ "${#PROBE_LIST[@]}" -ge "$NDEST" ] || die "получателей $NDEST, а в PROBE_PEERS адресов ${#PROBE_LIST[@]}.
-   Впишите в host.conf PROBE_PEERS=\"IP1 IP2 ...\" -- адреса приёмников на $MGMT_IFACE,
+   Впишите в host.conf PROBE_PEERS=\"IP1 IP2 ...\" -- адреса приёмников на управляющем интерфейсе,
    в том же порядке, что и в PEERS. Либо CLOCK=0, чтобы не мерить смещение."
   PROBE_LIST=("${PROBE_LIST[@]:0:$NDEST}")
 fi
@@ -93,8 +93,8 @@ need_root
 [ -x bin/dpdk_sender ] || die "нет bin/dpdk_sender -- make -j\$(nproc)"
 clock_check
 if clock_enabled && [ -z "$PROBE_PEERS" ]; then
-  die "PROBE_PEERS пуст -- адреса приёмников на управляющем интерфейсе ($MGMT_IFACE).
-   Посмотреть там: ip -4 -o addr show $MGMT_IFACE; вписать в host.conf
+  die "PROBE_PEERS пуст -- адреса приёмников на управляющем интерфейсе.
+   Посмотреть там: ip -4 -o addr show; вписать в host.conf
    PROBE_PEERS=\"IP1 IP2 ...\" в том же порядке, что и PEERS.
    Либо CLOCK=0, чтобы не мерить смещение."
 fi
