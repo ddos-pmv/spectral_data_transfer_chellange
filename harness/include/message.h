@@ -1,116 +1,216 @@
-// Wire messages for the fan-out harness. Every frame begins with a common
-// Header carrying the sequence id and send timestamp the consumer uses to
-// measure delivery; the rest of the frame describes a market-data event -- a
-// trade, a top-of-book (BBO) update, or a 5-level order book snapshot.
+// Wire messages for the fan-out harness.
+//
+// Every frame begins with a common Header carrying the sequence id and send
+// timestamp the consumer uses to measure delivery; the rest of the frame describes
+// a market-data event -- a trade, a top-of-book (BBO) update, or a 5-level order
+// book snapshot.
+//
+// ---------------------------------------------------------------------------
+// This format has been reworked from the original harness definition. The two
+// framing fields the consumer measures from, `seq_id` and `send_ts_ns`, are
+// unchanged and must stay that way. Everything else was examined field by field
+// and either kept with a reason, narrowed, or removed. Two principles drove it:
+//
+//   1. Do not send the same information twice. The original carried every price
+//      and size both as a double and as a scaled integer, plus `notional` which is
+//      simply price x quantity, plus 85 bytes of `reserved` padding across the
+//      three types, plus the symbol and venue as 32 bytes of text on every single
+//      message.
+//
+//   2. Make a lost message survivable. BBO and OrderBook are *state snapshots*, so
+//      a consumer that misses one recovers completely from the next. A trade is an
+//      *event*, so a lost trade is lost information -- unless the message also
+//      carries the running aggregates a consumer would otherwise accumulate. It
+//      does now (`cum_*` below), which is what lets a consumer tracking volume or
+//      VWAP re-derive correct totals from the very next trade after a gap.
+//
+// Principle 2 also rules out something tempting. Consecutive order books differ by
+// only a level or two, so encoding each book as a delta against the previous one
+// would be the largest remaining saving available -- and it is the wrong trade,
+// because a lost delta is unrecoverable where a lost snapshot self-corrects. For
+// the same reason nothing here is encoded relative to a previous message: every
+// frame is self-contained, so a gap cannot corrupt what follows it.
+//
+// Result: the largest frame is 176 bytes rather than 280. That matters twice over
+// on this transport. It shrinks every shared-memory ring slot (320 -> 192 bytes,
+// three cache lines instead of five), and it puts the whole packet -- 42 bytes of
+// Ethernet/IPv4/UDP plus 176 of frame = 218 -- inside the 224-byte extended LLQ
+// entry the ENA device accepts, so the NIC never has to DMA-read the body out of
+// host memory. The order book was the only message that did not fit before.
+// ---------------------------------------------------------------------------
 #pragma once
 
 #include <cstdint>
 
 namespace msg {
 
-inline constexpr uint32_t kBookDepth = 4;
+inline constexpr uint32_t kBookDepth = 5;
 
-enum class Type : uint8_t {
-  Trade = 0,
-  Bbo = 1,
-  OrderBook = 2,
+enum class Type : uint16_t {
+  Trade = 1,
+  Bbo = 2,
+  OrderBook = 3,
 };
 
-// Common framing header at the start of every message. seq_id and send_ts_ns
-// are the framing contract consumers rely on and must not move/change size;
-// the rest is ours to shape.
-//
-// flags_and_type bit layout (LSB first):
-//   bits [0:1] Type (this file's enum)
-//   bits [2:7] per-type flags -- meaning depends on Type:
-//     Trade:     bit2 aggressor_side, bit3 is_block_trade, bit4 is_rpi,
-//                bit5 is_liquidation, bits[6:7] tick_direction (0-3)
-//     OrderBook: bit2 is_snapshot
-//     Bbo:       unused
-//   bits [8:31] reserved for future flags
-//
-// It's a u32 rather than the u8 this actually needs because Header would pad
-// out to the same 24 bytes regardless (alignof(Header) is 8, from the two
-// u64 fields) -- a u8 flags field leaves 3 bytes of pure padding, so making
-// it u32 spends nothing extra and banks the headroom for future flags.
+// ---- reference data --------------------------------------------------------
+// Symbol, venue and currency names are *reference data*: static for the session
+// and identical on every message. Sending 48 bytes of text per message to say so
+// is waste, and no real venue does it -- they publish an instrument list out of
+// band and put a numeric code on the wire. The currencies are not sent at all,
+// because they are a property of the instrument rather than of the event.
+struct Instrument {
+  const char* symbol;
+  const char* venue;
+  const char* base_currency;
+  const char* quote_currency;
+};
+
+inline constexpr Instrument kInstruments[] = {
+    {"BTCUSDT", "BINANCE", "BTC", "USDT"},
+};
+inline constexpr uint16_t kInstrumentCount =
+    static_cast<uint16_t>(sizeof(kInstruments) / sizeof(kInstruments[0]));
+
+// ---- scaling ---------------------------------------------------------------
+// Prices and sizes are carried only as scaled integers. That is the canonical,
+// exactly representable form; the doubles the original format also carried were
+// the same numbers a second time, and floating-point prices are a well-known
+// source of comparison and rounding bugs. Consumers that want a double multiply.
+inline constexpr double kPriceTickSize = 0.01;  // price = price_ticks * 0.01
+inline constexpr double kQtyLotSize = 0.001;    // qty   = quantity_lots * 0.001
+
+// ---- flags -----------------------------------------------------------------
+// The original spent a whole byte on each of several booleans. Each of them
+// carries real meaning and none is dropped; they are simply bits now. The
+// aggressor side tells you which way the trade lifted, and block / RPI /
+// liquidation each change how a print should be read as signal.
+inline constexpr uint8_t kFlagAggressorSell = 1 << 0;
+inline constexpr uint8_t kFlagBlockTrade = 1 << 1;
+inline constexpr uint8_t kFlagRpi = 1 << 2;
+inline constexpr uint8_t kFlagLiquidation = 1 << 3;
+inline constexpr uint8_t kFlagSnapshot = 1 << 4;
+inline constexpr uint8_t kTickDirShift = 5;  // 2 bits: 4 possible directions
+inline constexpr uint8_t kTickDirMask = 0x3 << kTickDirShift;
+
+// Common framing header at the start of every message.
 struct Header {
-  uint64_t seq_id;          // monotonic, starts at 1
-  uint64_t send_ts_ns;      // producer send timestamp, ns since epoch
-  uint32_t instrument_id;   // symbol+venue, resolved once out of band -- see body TODO
-  uint32_t flags_and_type;  // see bit layout above
+  // These two are the harness contract with the consumer. Do not change them.
+  uint64_t seq_id;      // monotonic, starts at 1
+  uint64_t send_ts_ns;  // producer send timestamp, ns since epoch
+
+  uint16_t instrument;  // index into kInstruments
+  uint8_t type;         // Type
+  uint8_t flags;        // kFlag* above
+
+  // Venue timestamps, carried as offsets from this message's own send_ts_ns so
+  // that each frame stays self-contained. Nanosecond offsets of this magnitude fit
+  // an int32 comfortably, and the values are recovered exactly.
+  //
+  // `body_len` and `version` are gone: the first is fully derivable from `type`
+  // (see frame_size), and the second describes the protocol rather than the
+  // message, so it belongs in the datagram header instead of on every frame.
+  int32_t exch_ts_delta_ns;   // send_ts_ns    - exchange_ts_ns
+  int32_t match_ts_delta_ns;  // exchange_ts_ns - match_engine_ts_ns
+  uint32_t reserved;          // keeps the two stamps below 8-byte aligned
+
+  // Transport stamps, appended after the format fields so seq_id/send_ts_ns keep
+  // their offsets (the framing contract the consumer measures on). Together with
+  // send_ts_ns (t0) and the consumer's own read (t3) they cut end-to-end latency
+  // into three segments:
+  //
+  //   A = tx_ts_ns - send_ts_ns   producer ring -> sender, incl. burst assembly
+  //   B = rx_ts_ns - tx_ts_ns     the wire: TX, network, RX
+  //   C = t3       - rx_ts_ns     receiver -> consumer ring
+  //
+  // A and C stay inside one host, so they are exact. B is the only segment that
+  // crosses the host boundary and therefore the only one carrying the two clocks'
+  // offset -- which is constant within a run, so B's *shape* (p99-p50, jitter) is
+  // still exact and only its absolute level is unknown. That is why no clock
+  // synchronisation is needed to optimise against these.
+  //
+  // These 16 bytes are measurement apparatus, not market data. They sit on every
+  // frame rather than once per datagram because a datagram may carry several
+  // frames (see --pack) and each frame must stay self-contained.
+  uint64_t tx_ts_ns;    // stamped by the sender just before the NIC
+  uint64_t rx_ts_ns;    // stamped by the receiver right after the poll
 };
+static_assert(sizeof(Header) == 48, "Header layout changed");
 
-inline constexpr uint32_t kTypeBits = 2;
-inline constexpr uint32_t kTypeMask = (1u << kTypeBits) - 1;
-
-inline constexpr uint32_t kTradeFlagAggressorSide = 1u << 2;
-inline constexpr uint32_t kTradeFlagBlockTrade = 1u << 3;
-inline constexpr uint32_t kTradeFlagRpi = 1u << 4;
-inline constexpr uint32_t kTradeFlagLiquidation = 1u << 5;
-inline constexpr uint32_t kTradeTickDirectionShift = 6;  // 2 bits, values 0-3
-
-inline constexpr uint32_t kBookFlagSnapshot = 1u << 2;
-
-inline uint32_t pack_type(Type t) {
-  return static_cast<uint32_t>(t) & kTypeMask;
-}
-inline Type unpack_type(uint32_t flags_and_type) {
-  return static_cast<Type>(flags_and_type & kTypeMask);
-}
-
-// No alignas(64) here: cache-line alignment is the ring Slot's concern, not
-// the wire format's -- padding a message out to 64 bytes just to hit that
-// boundary wastes bytes on every transport that isn't the shm ring itself.
-struct Trade {
+struct alignas(8) Trade {
   Header header;
-  uint64_t seller_order_id;
-  uint64_t buyer_order_id;
-  uint64_t trade_id;
-  uint64_t match_engine_ts_ns;
   int64_t price_ticks;
   int64_t quantity_lots;
-  // uint8_t padding[56];
-};
+  uint64_t trade_id;  // the venue's identity for this print; not derivable
 
-struct Bbo {
+  // Running aggregates over the trade stream. These are what make a lost trade
+  // survivable: a consumer that accumulates per-trade quantity is permanently
+  // wrong after one missed message and cannot detect it, whereas a consumer that
+  // reads these is exactly correct again on the next trade it receives. Wrapping
+  // is harmless -- differences stay exact modulo 2^64.
+  uint64_t cum_quantity_lots;
+  uint64_t cum_notional_ticks;
+  uint64_t cum_trade_count;
+};
+static_assert(sizeof(Trade) == 96, "Trade layout changed");
+
+struct alignas(8) Bbo {
   Header header;
-  uint64_t update_id;
-  uint64_t match_engine_ts_ns;
+  uint64_t update_id;      // absolute: a cross-message delta would desync on loss
   int64_t bid_price_ticks;
-  int64_t ask_price_ticks;
-  int64_t bid_size_lots;
-  int64_t ask_size_lots;
-  uint32_t bid_order_count;
-  uint32_t ask_order_count;
-  // uint8_t padding[48];
+  int32_t spread_ticks;    // ask = bid + spread; a spread is small by nature
+  int32_t bid_size_lots;
+  int32_t ask_size_lots;
+  uint16_t bid_order_count;
+  uint16_t ask_order_count;
 };
+static_assert(sizeof(Bbo) == 80, "Bbo layout changed");
 
-// Structure-of-arrays book levels: grouping all price_ticks together, then
-// all size_lots, then all order_count avoids the 4-byte pad that a
-// per-level {price_ticks, size_lots, order_count} struct needs after each
-// order_count (to re-align the next level's price_ticks to 8) -- 10 of those
-// pads (5 bid + 5 ask) was real waste for pure alignment, not data.
-template <uint32_t Depth>
-struct Levels {
-  int64_t price_ticks[Depth];
-  int64_t size_lots[Depth];
-  uint32_t order_count[Depth];
+// One side of the book. The top level is absolute and the levels beneath it are
+// offsets from that top -- safe because they travel inside the same frame, so loss
+// cannot separate them.
+struct Side {
+  int64_t top_price_ticks;
+  int32_t price_offset_ticks[kBookDepth - 1];
+  int32_t size_lots[kBookDepth];
+  uint16_t order_count[kBookDepth];
+  uint16_t reserved;
 };
+static_assert(sizeof(Side) == 56, "Side layout changed");
 
-struct OrderBook {
+struct alignas(8) OrderBook {
   Header header;
   uint64_t update_id;
-  uint64_t prev_update_id;
-  uint64_t match_engine_ts_ns;
-  Levels<kBookDepth> bidsLevels;
-  Levels<kBookDepth> asksLevels;
-  uint32_t checksum;
-  // uint8_t padding[44];
+  uint16_t prev_update_gap;  // update_id - prev_update_id, normally 1
+  uint16_t reserved;
+  uint32_t checksum;         // the snapshot's own integrity check: worth its bytes
+  Side bids;
+  Side asks;
 };
+static_assert(sizeof(OrderBook) == 176, "OrderBook layout changed");
 
-inline constexpr uint32_t kMaxFrame =std::max(std::max(sizeof(Bbo) ,sizeof(OrderBook)), sizeof(Trade));
-static_assert(kMaxFrame > 0, "kMaxFrame must be cumputed at compile time");
+inline constexpr uint32_t kMaxFrame = sizeof(OrderBook);
 static_assert(sizeof(Trade) <= kMaxFrame, "kMaxFrame must fit every message");
 static_assert(sizeof(Bbo) <= kMaxFrame, "kMaxFrame must fit every message");
+
+// Frame size for a message type. This is why `body_len` no longer needs to be sent
+// on every message: each type is a fixed size, so the length is implied by the two
+// bits that say which type it is. Returns 0 for an unknown type, which callers
+// parsing untrusted input must treat as malformed.
+inline constexpr uint32_t frame_size(uint8_t type) {
+  switch (static_cast<Type>(type)) {
+    case Type::Trade: return sizeof(Trade);
+    case Type::Bbo: return sizeof(Bbo);
+    case Type::OrderBook: return sizeof(OrderBook);
+  }
+  return 0;
+}
+
+// Helpers for reconstructing the absolute venue timestamps a consumer may want.
+inline uint64_t exchange_ts_ns(const Header& h) {
+  return h.send_ts_ns - static_cast<uint64_t>(h.exch_ts_delta_ns);
+}
+inline uint64_t match_engine_ts_ns(const Header& h) {
+  return exchange_ts_ns(h) - static_cast<uint64_t>(h.match_ts_delta_ns);
+}
 
 }  // namespace msg

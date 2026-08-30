@@ -31,6 +31,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -147,9 +148,18 @@ int main(int argc, char** argv) {
       perror("recvmmsg");
       continue;
     }
+    // t2: one clock read for the whole recvmmsg batch -- they were all already
+    // sitting in the socket buffer when the syscall returned.
+    const uint64_t rx_ts = util::now_ns();
     for (int i = 0; i < n; ++i) {
       const uint32_t len = msgs[i].msg_len;
-      if (len == 0 || len > shm::kFrameCap) { ++bad_pkts; continue; }
+      if (len < sizeof(msg::Header) || len > shm::kFrameCap) {
+        ++bad_pkts;
+        continue;
+      }
+      std::memcpy(static_cast<uint8_t*>(iovs[i].iov_base) +
+                      offsetof(msg::Header, rx_ts_ns),
+                  &rx_ts, sizeof(rx_ts));
       ring.publish(iovs[i].iov_base, len);
       ++recv_pkts;
     }
