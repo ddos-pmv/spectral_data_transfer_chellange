@@ -631,6 +631,16 @@ class SenderPort {
 
   static constexpr uint32_t kMaxDests = 16;
 
+  // На сколько TX-очередей можно размазать ОДНОГО получателя. Ограничено, чтобы
+  // массив батчей у вызывающего (kMaxDests * kMaxDestQueues) остался постоянного
+  // размера.
+  //
+  // Очереди опустошаются независимо, поэтому размазывание СОЗНАТЕЛЬНО ломает
+  // порядок между пакетами одного получателя. Приёмник обязан иметь окно
+  // переупорядочивания (reorder.h), иначе MonotonicGate превратит перестановку
+  // в потерю.
+  static constexpr uint16_t kMaxDestQueues = 8;
+
   static_assert(kHeaderLen + shm::kFrameCap <= RTE_MBUF_DEFAULT_DATAROOM, "frame + L2/L3/L4 headers must fit on mbuf");
   static_assert(kHeaderLen + shm::kFrameCap <= 224, "packet must fit ENA large-LLQ inline entry");
 
@@ -666,7 +676,7 @@ class SenderPort {
              uint32_t cache_size, uint16_t nb_txd,
              const std::vector<DestSpec>& dests, uint32_t src_ip_be,
              uint16_t src_port, uint16_t queue_cap = 0,
-             uint16_t mtu = RTE_ETHER_MTU)
+             uint16_t mtu = RTE_ETHER_MTU, uint16_t queues_per_dest = 1)
       : src_ip_be_(src_ip_be), src_port_(src_port) {
     if (dests.empty() || dests.size() > kMaxDests) {
       std::fprintf(stderr, "SenderPort: need 1..%u destinations, got %zu\n",
@@ -674,7 +684,15 @@ class SenderPort {
       std::exit(1);
     }
 
-    uint16_t wanted_txq = static_cast<uint16_t>(dests.size());
+    if (queues_per_dest == 0 || queues_per_dest > kMaxDestQueues) {
+      std::fprintf(stderr, "SenderPort: queues_per_dest must be 1..%u, got %u\n",
+                   kMaxDestQueues, queues_per_dest);
+      std::exit(1);
+    }
+    queues_per_dest_ = queues_per_dest;
+
+    uint16_t wanted_txq =
+        static_cast<uint16_t>(dests.size() * queues_per_dest);
     if (queue_cap != 0 && queue_cap < wanted_txq) wanted_txq = queue_cap;
 
     // TX only: the sender never receives, so it asks for no RX queues and
@@ -694,9 +712,29 @@ class SenderPort {
     n_dests_ = static_cast<uint32_t>(dests.size());
     owns_port_ = true;
 
+    // Размазывание, которое молча схлопнулось из-за нехватки очередей, всё равно
+    // отработало бы и напечатало число -- и это число означало бы не то, что
+    // написано в конфиге. Отказываем громко.
+    if (queues_per_dest_ > 1 &&
+        nb_txq_ < static_cast<uint16_t>(n_dests_ * queues_per_dest_)) {
+      std::fprintf(stderr,
+                   "SenderPort: %u получателей x %u очередей = %u нужно, "
+                   "карта дала %u\n",
+                   n_dests_, queues_per_dest_,
+                   static_cast<unsigned>(n_dests_ * queues_per_dest_),
+                   static_cast<unsigned>(nb_txq_));
+      std::exit(1);
+    }
+
     for (uint32_t d = 0; d < n_dests_; ++d) {
       dests_[d].spec = dests[d];
-      dests_[d].queue_id = static_cast<uint16_t>(d % nb_txq_);
+      // При размазывании получатель d владеет непрерывным блоком с d*K; без
+      // него остаётся заворот, который и позволяет получателям делить очередь,
+      // когда карта даёт их меньше, чем получателей.
+      dests_[d].queue_id =
+          queues_per_dest_ > 1
+              ? static_cast<uint16_t>(d * queues_per_dest_)
+              : static_cast<uint16_t>(d % nb_txq_);
       build_header_template(d);
     }
   }
@@ -713,7 +751,10 @@ class SenderPort {
   uint32_t tx_spins() const { return tx_spins_; }
   void set_tx_spins(uint32_t n) { tx_spins_ = n ? n : 1; }
   uint32_t n_dests() const { return n_dests_; }
+  // Первая очередь этого получателя; ему принадлежит
+  // [queue_of(d), queue_of(d) + queues_per_dest()).
   uint16_t queue_of(uint32_t dest_idx) const { return dests_[dest_idx].queue_id; }
+  uint16_t queues_per_dest() const { return queues_per_dest_; }
   const DestSpec& dest(uint32_t dest_idx) const { return dests_[dest_idx].spec; }
 
   SenderPort(const SenderPort&) = delete;
@@ -929,6 +970,7 @@ class SenderPort {
   uint16_t nb_txq_ = 0;
   uint16_t max_tx_queues_ = 0;
   uint16_t mtu_ = RTE_ETHER_MTU;
+  uint16_t queues_per_dest_ = 1;
   uint32_t n_dests_ = 0;
 
   rte_ether_addr src_mac_{};

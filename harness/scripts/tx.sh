@@ -12,6 +12,7 @@
 #   sudo PACK=8 ./scripts/tx.sh               # до 8 кадров в датаграмме
 #   sudo PACK=8 MIN_PACK=4 ./scripts/tx.sh    # и ДОЖИДАТЬСЯ четырёх
 #   sudo MTU=9001 PACK=50 MIN_PACK=16 ./scripts/tx.sh   # jumbo, до 50 кадров
+#   sudo DEST_QUEUES=4 ./scripts/tx.sh        # размазать по 4 очередям (нужен REORDER)
 #   sudo CLOCK=0 ./scripts/tx.sh              # без замера смещения часов
 #
 # Замер смещения требует PROBE_PEERS в host.conf -- адреса приёмников на
@@ -85,6 +86,25 @@ PACK_WAIT_SPINS=${PACK_WAIT_SPINS:-10000}
 # то есть разумный диапазон -- десятки, не тысячи.
 PACK_BACKOFF=${PACK_BACKOFF:-0}
 
+# TX-очередей на ОДНОГО получателя. 1 = как было: очередь на получателя.
+#
+# Больше единицы СОЗНАТЕЛЬНО ломает порядок: очереди опустошаются независимо, и
+# пакеты одного получателя приходят вперемешку. Приёмник обязан быть запущен с
+# окном переупорядочивания (REORDER=N в rx.sh), иначе MonotonicGate посчитает
+# перестановку потерей -- на синтетике при разбросе 15 терялось 78% потока.
+#
+# Зачем это вообще: проверить, ограничивает ли пакетный темп ОДНА очередь ENA
+# или инстанс целиком. Нужно n_получателей x DEST_QUEUES очередей на карте,
+# иначе отправитель откажется стартовать и напечатает, сколько дала карта.
+DEST_QUEUES=${DEST_QUEUES:-1}
+if [ "$DEST_QUEUES" = 1 ]; then
+  SENDER_BIN=bin/dpdk_sender
+  SPREAD_ARGS=
+else
+  SENDER_BIN=bin/dpdk_sender_mq
+  SPREAD_ARGS="--dest-queues $DEST_QUEUES"
+fi
+
 # MTU (умолчание в lib.sh). 1500 -- как у карты из коробки, в датаграмму влезает
 # 8 кадров (28 + 8*176 = 1436). 9001 -- jumbo внутри VPC, и тогда PACK до 50.
 # Ставить надо НА ОБЕИХ сторонах, у приёмника не меньше.
@@ -112,6 +132,7 @@ need_uint PACK "$PACK" 1 "$PACK_MAX"
 need_uint MIN_PACK "$MIN_PACK" 1 "$PACK"
 need_uint PACK_WAIT_SPINS "$PACK_WAIT_SPINS" 1 10000000
 need_uint PACK_BACKOFF "$PACK_BACKOFF" 0 100000
+need_uint DEST_QUEUES "$DEST_QUEUES" 1 8
 
 # Получатели. Форма адресации ровно одна -- список MAC@IP:PORT; пара
 # PEER_MAC/PEER_IP сворачивается в него здесь же. Дальше ни скрипт, ни сам
@@ -158,7 +179,7 @@ fi
 check_pool SENDER_MBUFS "$SENDER_MBUFS" SENDER_TXD "$SENDER_TXD" "$BURST" "$NDEST"
 
 need_root
-[ -x bin/dpdk_sender ] || die "нет bin/dpdk_sender -- make -j\$(nproc)"
+[ -x "$SENDER_BIN" ] || die "нет $SENDER_BIN -- make -j\$(nproc)"
 clock_check
 if clock_enabled && [ -z "$PROBE_PEERS" ]; then
   die "PROBE_PEERS пуст -- адреса приёмников на управляющем интерфейсе.
@@ -173,8 +194,8 @@ SRC_IP=${SRC_IP:-$(local_ip)}
 
 # Чужой отправитель, переживший Ctrl+C прошлого прогона, удваивает нагрузку:
 # пакеты упираются в PPS-лимит ENI, и в замерах появляются потери и хвост в мс.
-STALE=$(pgrep -x 'producer|dpdk_sender' | tr '\n' ' ' || true)
-[ -z "$STALE" ] || die "уже запущены producer/dpdk_sender (pid: $STALE) -- добейте их"
+STALE=$(pgrep -x 'producer|dpdk_sender|dpdk_sender_mq' | tr '\n' ' ' || true)
+[ -z "$STALE" ] || die "уже запущены producer/отправитель (pid: $STALE) -- добейте их"
 
 COUNT_ARG=()
 [ "$COUNT" = 0 ] || COUNT_ARG=(--count "$COUNT")
@@ -251,6 +272,7 @@ row ядра "producer $CPU_PRODUCER, отправитель $CPU_SENDER"
 row темп "$RATE msg/s, тип $TYPE"
 row очередь "TX $SENDER_TXD дескрипторов, burst $BURST датаграмм, ретраев $TX_SPINS"
 [ "$PACK" = 1 ] || row упаковка "до $PACK кадров в датаграмме, до $((BURST * PACK)) сообщений за проход"
+[ "$DEST_QUEUES" = 1 ] || row размазывание "$DEST_QUEUES очередей на получателя -- ПОРЯДОК ЛОМАЕТСЯ, нужен REORDER на приёмнике"
 [ "$PACK_BACKOFF" = 0 ] || row пауза "$PACK_BACKOFF оборотов между опросами кольца (~$((PACK_BACKOFF / 2)) нс)"
 [ "$MIN_PACK" = 1 ] || row ждать "не меньше $MIN_PACK кадров, предел $PACK_WAIT_SPINS оборотов"
 row пул "$SENDER_MBUFS mbuf"
@@ -269,13 +291,14 @@ for _ in $(seq 50); do [ -e /dev/shm/fanout_ring ] && break; sleep 0.1; done
 # В файл и фоном, а не в конвейер: по Ctrl+C сигнал прилетает всей группе
 # процессов переднего плана, tee умирает первым, и статистика отправителя
 # уходит в закрытую трубу -- SIGPIPE убивает его на середине вывода.
-taskset -c "$CPU_SENDER" setarch -R ./bin/dpdk_sender \
+taskset -c "$CPU_SENDER" setarch -R "./$SENDER_BIN" \
   -l "$CPU_SENDER" --file-prefix tx \
   $DEV \
   -- --shm /fanout_ring --slots "$SLOTS" \
      --src-ip "$SRC_IP" "${DEST_ARGS[@]}" --burst "$BURST" \
      --mbufs "$SENDER_MBUFS" --txd "$SENDER_TXD" --tx-spins "$TX_SPINS" \
      --pack "$PACK" --min-pack "$MIN_PACK" --mtu "$MTU" \
+     $SPREAD_ARGS \
      --pack-wait-spins "$PACK_WAIT_SPINS" --pack-backoff "$PACK_BACKOFF" \
      "${COUNT_ARG[@]}" \
   > "$RUN/sender.log" 2>&1 &
