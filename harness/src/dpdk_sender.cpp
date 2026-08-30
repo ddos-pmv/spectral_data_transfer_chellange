@@ -529,6 +529,10 @@ int main(int argc, char** argv) {
                "alloc_fail : %llu\t(mbuf pool empty)\n"
                "empty_spins: %llu\t(read from ring return none)\n"
                "avg_burst  : %.2f\t(avg messages in burst, wanted to send by burst)\n"
+               "tx_calls   : %llu\t(вызовов rte_eth_tx_burst)\n"
+               "tx_zero    : %llu\t(%.1f%% -- вызовов, не принявших ничего)\n"
+               "offered/call: %.2f\t(пакетов предложено за вызов)\n"
+               "real_avg_burst: %.2f\t(ПРИНЯТО картой за вызов; заполнение %.1f%%)\n"
                "tx_spins   : %u\t(ретраев на полном TX-кольце, прежде чем выбросить)\n"
                "elapsed    : %.1f s\n"
                "msg in     : %.0f msg/s\t(прочитано из кольца)\n"
@@ -543,6 +547,15 @@ int main(int argc, char** argv) {
                static_cast<unsigned long long>(alloc_fail),
                static_cast<unsigned long long>(empty_spins),
                bursts ? static_cast<double>(burst_msgs) / static_cast<double>(bursts) : 0.0,
+               static_cast<unsigned long long>(sender.tx_calls()),
+               static_cast<unsigned long long>(sender.tx_calls_zero()),
+               sender.tx_calls() ? static_cast<double>(sender.tx_calls_zero()) *
+                                       100.0 /
+                                       static_cast<double>(sender.tx_calls())
+                                 : 0.0,
+               sender.offered_avg_burst(),
+               sender.real_avg_burst(),
+               sender.tx_fill_rate() * 100.0,
                sender.tx_spins(),
                elapsed_s,
                elapsed_s > 0 ? static_cast<double>(msgs) / elapsed_s : 0.0,

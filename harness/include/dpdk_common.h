@@ -637,9 +637,43 @@ class SenderPort {
 
   // One non-blocking pass at a single queue. The retry policy lives in
   // send_all() below, which needs to see every queue before spinning on any.
-  uint16_t tx_burst(uint16_t queue_id, rte_mbuf** pkts, uint16_t n) const noexcept {
-    return rte_eth_tx_burst(port_id_, queue_id, pkts, n);
+  // Не const: это единственная точка, которая видит и предложенное, и принятое,
+  // поэтому здесь же ведётся учёт. avg_burst у вызывающего -- это сколько
+  // сообщений он ХОТЕЛ отправить; сколько карта взяла за вызов, знает только
+  // возвращаемое значение, и без этих счётчиков оно нигде не оседает.
+  uint16_t tx_burst(uint16_t queue_id, rte_mbuf** pkts, uint16_t n) noexcept {
+    const uint16_t k = rte_eth_tx_burst(port_id_, queue_id, pkts, n);
+    ++tx_calls_;
+    tx_offered_ += n;
+    tx_accepted_ += k;
+    // Полностью холостой вызов -- отдельно от частичного: под перегрузкой это
+    // разные режимы. Частичный означает, что кольцо заполняется; нулевой -- что
+    // оно уже полно и весь вызов был потрачен впустую.
+    if (k == 0) ++tx_calls_zero_;
+    return k;
   }
+
+  // Сколько пакетов карта приняла за один вызов tx_burst, в среднем.
+  double real_avg_burst() const {
+    return tx_calls_ ? static_cast<double>(tx_accepted_) /
+                           static_cast<double>(tx_calls_)
+                     : 0.0;
+  }
+  // Сколько ей предлагали за вызов, в среднем. Разрыв с real_avg_burst и есть
+  // недобор.
+  double offered_avg_burst() const {
+    return tx_calls_ ? static_cast<double>(tx_offered_) /
+                           static_cast<double>(tx_calls_)
+                     : 0.0;
+  }
+  // Доля предложенного, которую карта взяла.
+  double tx_fill_rate() const {
+    return tx_offered_ ? static_cast<double>(tx_accepted_) /
+                             static_cast<double>(tx_offered_)
+                       : 0.0;
+  }
+  uint64_t tx_calls() const { return tx_calls_; }
+  uint64_t tx_calls_zero() const { return tx_calls_zero_; }
 
   // What the caller hands send_all(): one entry per queue that has packets.
   // `queue_id` is carried rather than implied by the array index: with a
@@ -655,7 +689,7 @@ class SenderPort {
   // One pass over every queue before retrying any. A per-queue retry loop would
   // spin on queue 0 while queue 1's packets sit unsent, making one receiver pay
   // for a full ring that is not even its own.
-  void send_all(QueueBatch* batches, uint16_t n_batches) const noexcept {
+  void send_all(QueueBatch* batches, uint16_t n_batches) noexcept {
     uint32_t spins = 0;
     for (;;) {
       bool pending = false;
@@ -772,6 +806,11 @@ class SenderPort {
 
   uint32_t tx_spins_ = kDefaultTxSpins;
   uint16_t queues_per_dest_ = 1;
+
+  uint64_t tx_calls_ = 0;       // вызовов rte_eth_tx_burst
+  uint64_t tx_calls_zero_ = 0;  // из них не принявших ни одного пакета
+  uint64_t tx_offered_ = 0;     // пакетов предложено суммарно
+  uint64_t tx_accepted_ = 0;    // пакетов принято суммарно
 
   bool tx_ip_cksum_offload_ = false;
   bool owns_port_ = false;
