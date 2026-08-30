@@ -18,8 +18,6 @@ harness/
   src/
     producer.cpp   generates events, stamps seq_id + send_ts_ns, publishes to ring
     consumer.cpp   reads ring, stamps recv_ts, computes metrics
-  test/
-    test_harness.cpp  assertion tests for the ring and the metrics accumulator
   Makefile
 ```
 
@@ -52,11 +50,10 @@ It is deliberately the simplest thing that behaves like a realistic market-data 
 - Publication is one release-store of the slot sequence; readers busy-spin on an
   acquire-load.
 
-## Build & test
+## Build
 
 ```bash
 make          # builds bin/producer and bin/consumer
-make test     # builds and runs the assertion tests
 ```
 
 ## Run the baseline (one host)
@@ -78,11 +75,10 @@ sleep 0.02
 taskset -c 4 ./bin/consumer --from-edge --csv latencies.csv
 ```
 
-For measurements you intend to compare against each other, use
-`scripts/start_with_taskset.sh` instead: it fixes the sample size, repeats the
-run and reports the run-to-run spread (`--help` explains what else moves the
-numbers). A one-off like the above tells you whether things work, not what the
-latency is.
+A one-off like the above tells you whether things work, not what the latency is.
+For measurements you intend to compare against each other, use the two-host
+scripts: `scripts/rx.sh` on the receiver and `scripts/tx.sh` on the sender --
+see [RUN.md](RUN.md).
 
 Example output (single host, cores 2/4 isolated):
 

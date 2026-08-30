@@ -1,0 +1,8 @@
+
+# Локальное окружение разработчика
+.idea/
+.vscode/
+.claude/
+.mcp.json
+.venv/
+/.PVS-Studio/

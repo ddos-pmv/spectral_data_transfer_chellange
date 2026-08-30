@@ -11,3 +11,13 @@ scripts/host.conf
 scripts/.host-state
 sweep/
 sweep-rx.log
+
+# Локальное окружение разработчика, не относится к решению
+.idea/
+.vscode/
+.claude/
+.mcp.json
+.venv/
+
+# Рабочие черновики, в решение не входят
+notes.md

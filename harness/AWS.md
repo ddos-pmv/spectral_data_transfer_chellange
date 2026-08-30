@@ -435,7 +435,8 @@ sudo systemctl stop irqbalance && sudo systemctl disable irqbalance
 
 ```bash
 ./scripts/checkenv.sh              # секция «Прерывания»
-sudo ./scripts/irq.py 30 2,3       # дельта за 30 секунд, а не с загрузки
+./scripts/irq.sh                   # кто где сидит
+sudo ./scripts/irq.sh apply        # согнать все IRQ на housekeeping-ядра
 ```
 
 Подвижные прерывания переносятся на housekeeping-ядра:

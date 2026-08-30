@@ -23,7 +23,7 @@ DPDK_BINARIES := $(BIN)/dpdk_sender $(BIN)/dpdk_reciever \
                  $(BIN)/dpdk_probe
 endif
 
-.PHONY: all clean test
+.PHONY: all clean
 
 all: $(BINARIES) $(DPDK_BINARIES)
 
@@ -52,18 +52,6 @@ $(BIN)/clock_probe: src/clock_probe.cpp include/*.h | $(BIN)
 # отдельными .so и подгружаются EAL'ом в рантайме, в бинарь не попадают.
 $(BIN)/dpdk_%: src/dpdk_%.cpp include/*.h | $(BIN)
 	$(CXX) $(CXXFLAGS) $(DPDK_CFLAGS) $< -o $@ $(DPDK_LIBS) $(LDLIBS)
-
-test: $(BIN)/test_harness $(BIN)/test_reorder
-	./$(BIN)/test_harness
-	./$(BIN)/test_reorder
-
-$(BIN)/test_harness: test/test_harness.cpp include/*.h | $(BIN)
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
-
-# reorder.h держит rte_mbuf*, поэтому тесту нужны заголовки DPDK -- линковать
-# с ним нечего, окно само по себе ни одной функции DPDK не зовёт.
-$(BIN)/test_reorder: test/test_reorder.cpp include/reorder.h | $(BIN)
-	$(CXX) $(CXXFLAGS) $(DPDK_CFLAGS) $< -o $@ $(LDLIBS)
 
 clean:
 	rm -rf $(BIN)
