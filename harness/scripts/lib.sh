@@ -267,7 +267,15 @@ PROBE=${PROBE:-bin/clock_probe}
 PROBE_PORT=${PROBE_PORT:-51100}
 PROBE_COUNT=${PROBE_COUNT:-20000}
 PROBE_IDLE_S=${PROBE_IDLE_S:-6}    # отражатель ждёт столько без трафика и выходит
-PROBE_PEER=${PROBE_PEER:-}         # tx: адрес приёмника на управляющем интерфейсе
+# Сколько отражатель ждёт ПЕРВОГО пакета. При веере отправитель обходит приёмников по
+# одному, и последний ждёт всех предыдущих замеров: 20000 пинг-понгов на 5000/с -- это
+# 4 с на приёмника. Ста секунд хватает на любой разумный веер, а простаивает отражатель
+# только на стенде, где всё равно ничего больше не идёт.
+PROBE_WAIT_S=${PROBE_WAIT_S:-100}
+# tx: адреса приёмников на управляющем интерфейсе, в том же порядке, что и PEERS.
+# PROBE_PEER -- частный случай на одного; ниже он сворачивается в список.
+PROBE_PEERS=${PROBE_PEERS:-${PROBE_PEER:-}}
+PROBE_PEER=${PROBE_PEER:-}
 MGMT_IFACE=${MGMT_IFACE:-ens5}
 
 clock_enabled() { [ "$CLOCK" = 1 ]; }
@@ -285,15 +293,29 @@ clock_reflect() {
   local ip
   ip=$(ip -4 -o addr show "$MGMT_IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
   [ -n "$ip" ] || die "не определить адрес $MGMT_IFACE (или CLOCK=0)"
-  row "отражатель $1" "$ip:$PROBE_PORT, выход через ${PROBE_IDLE_S}с тишины"
-  "$PROBE" --reflect --bind "$ip" --port "$PROBE_PORT" --idle-s "$PROBE_IDLE_S" \
+  row "отражатель $1" "$ip:$PROBE_PORT, ждёт до ${PROBE_WAIT_S}с, выход через ${PROBE_IDLE_S}с тишины"
+  "$PROBE" --reflect --bind "$ip" --port "$PROBE_PORT" \
+    --idle-s "$PROBE_IDLE_S" --wait-s "$PROBE_WAIT_S" \
     >/dev/null 2>&1 || true
 }
 
 # Пробник (tx). Печатает смещение в нс на stdout; "p50=" и число разделены
 # пробелами, поэтому по полям awk их не собрать. Минус обязателен.
 clock_probe_once() {
-  "$PROBE" --probe --peer "$PROBE_PEER:$PROBE_PORT" --count "$PROBE_COUNT" 2>&1 \
+  "$PROBE" --probe --peer "$2:$PROBE_PORT" --count "$PROBE_COUNT" 2>&1 \
     | tee -a "$1" \
     | sed -nE 's/.*clock offset[[:space:]]+p50=[[:space:]]*(-?[0-9]+).*/\1/p'
+}
+
+# Обойти всех приёмников по очереди. Печатает по строке "адрес смещение" на каждого;
+# пустое смещение = замер не удался, решает вызывающий. Последовательно, а не
+# параллельно: пинг-понг мерит путь, и четыре одновременных пробника на одном ядре
+# мерили бы уже друг друга.
+clock_probe_all() {
+  local log=$1; shift
+  local peer off
+  for peer in "$@"; do
+    off=$(clock_probe_once "$log" "$peer")
+    echo "$peer ${off:-}"
+  done
 }

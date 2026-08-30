@@ -32,7 +32,7 @@
 // than queueing behind our own traffic. Run it alongside a load to get the loaded figure.
 //
 // Usage:
-//   clock_probe --reflect [--bind ADDR] [--port P] [--core N] [--idle-s S]
+//   clock_probe --reflect [--bind ADDR] [--port P] [--core N] [--idle-s S] [--wait-s S]
 //   clock_probe --probe --peer HOST:PORT [--src ADDR] ...
 //   clock_probe --probe --peer HOST[:PORT] [--count N] [--rate R] [--core N] [--csv PATH]
 #include <arpa/inet.h>
@@ -89,6 +89,11 @@ struct Config {
   uint64_t count = 200000;
   uint32_t rate = 5000;  // ping-pongs per second
   uint32_t idle_s = 30;  // reflector exits after this long with no traffic
+  // Reflector: how long to wait for the FIRST packet, separately from idle_s. With several
+  // receivers the sender probes them one after another, so the last reflector sits silent
+  // for as long as all the earlier probes take. One timeout cannot serve both jobs: short
+  // enough to end a probe promptly is far too short to wait your turn. 0 = same as idle_s.
+  uint32_t wait_s = 0;
   std::string csv;
 };
 
@@ -113,6 +118,7 @@ Config parse_args(int argc, char** argv) {
     else if (a == "--count") c.count = std::stoull(next());
     else if (a == "--rate") c.rate = static_cast<uint32_t>(std::stoul(next()));
     else if (a == "--idle-s") c.idle_s = static_cast<uint32_t>(std::stoul(next()));
+    else if (a == "--wait-s") c.wait_s = static_cast<uint32_t>(std::stoul(next()));
     else if (a == "--csv") c.csv = next();
     else {
       fprintf(stderr, "unknown arg: %s\n", a.c_str());
@@ -203,8 +209,9 @@ int run_reflector(const Config& cfg) {
   if (fd < 0) return 1;
   char addr[INET_ADDRSTRLEN] = {0};
   inet_ntop(AF_INET, &local.sin_addr, addr, sizeof(addr));
-  fprintf(stderr, "reflector: %s:%u, busy-poll, exits after %us idle\n", addr,
-          ntohs(local.sin_port), cfg.idle_s);
+  const uint32_t wait_s = cfg.wait_s ? cfg.wait_s : cfg.idle_s;
+  fprintf(stderr, "reflector: %s:%u, busy-poll, waits %us for the first packet, "
+          "then exits after %us idle\n", addr, ntohs(local.sin_port), wait_s, cfg.idle_s);
 
   uint64_t reflected = 0;
   uint64_t last = util::now_ns();
@@ -217,7 +224,8 @@ int run_reflector(const Config& cfg) {
     const ssize_t n = recvfrom(fd, &p, sizeof(p), 0,
                                reinterpret_cast<sockaddr*>(&from), &flen);
     if (n < 0) {
-      if (util::now_ns() - last > static_cast<uint64_t>(cfg.idle_s) * 1000000000ull) break;
+      const uint64_t limit = reflected ? cfg.idle_s : wait_s;
+      if (util::now_ns() - last > limit * 1000000000ull) break;
       continue;
     }
     const uint64_t t1 = util::now_ns();

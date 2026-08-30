@@ -11,8 +11,11 @@
 #   sudo TX_SPINS=1 ./scripts/tx.sh           # не крутиться на полном TX-кольце
 #   sudo CLOCK=0 ./scripts/tx.sh              # без замера смещения часов
 #
-# Замер смещения требует PROBE_PEER в host.conf -- адрес приёмника на
-# управляющем интерфейсе. rx.sh на той стороне поднимает отражатель сам.
+# Замер смещения требует PROBE_PEERS в host.conf -- адреса приёмников на
+# управляющем интерфейсе, по одному на каждого, в том же порядке, что PEERS.
+# rx.sh на каждой приёмной машине поднимает свой отражатель сам, а смещение
+# снимается до каждого отдельно: часы у машин расходятся независимо, и одна
+# общая поправка на веер была бы средним по разным расхождениям.
 #
 # Размеры TX-очереди и пула mbuf -- SENDER_TXD/SENDER_MBUFS в host.conf.
 #
@@ -73,14 +76,26 @@ for peer in $PEERS; do
 done
 NDEST=$(( ${#DEST_ARGS[@]} / 2 ))
 
+# Смещение часов меряется до КАЖДОГО приёмника: у каждой машины свои часы, и одна
+# общая поправка на веер смешала бы разные расхождения в одну цифру. Порядок в
+# PROBE_PEERS -- тот же, что в PEERS, поэтому RECEIVERS=N режет оба списка одинаково.
+PROBE_LIST=($PROBE_PEERS)
+if clock_enabled; then
+  [ "${#PROBE_LIST[@]}" -ge "$NDEST" ] || die "получателей $NDEST, а в PROBE_PEERS адресов ${#PROBE_LIST[@]}.
+   Впишите в host.conf PROBE_PEERS=\"IP1 IP2 ...\" -- адреса приёмников на $MGMT_IFACE,
+   в том же порядке, что и в PEERS. Либо CLOCK=0, чтобы не мерить смещение."
+  PROBE_LIST=("${PROBE_LIST[@]:0:$NDEST}")
+fi
+
 check_pool SENDER_MBUFS "$SENDER_MBUFS" SENDER_TXD "$SENDER_TXD" "$BURST" "$NDEST"
 
 need_root
 [ -x bin/dpdk_sender ] || die "нет bin/dpdk_sender -- make -j\$(nproc)"
 clock_check
-if clock_enabled && [ -z "$PROBE_PEER" ]; then
-  die "PROBE_PEER пуст -- адрес приёмника на управляющем интерфейсе ($MGMT_IFACE).
-   Посмотреть там: ip -4 -o addr show $MGMT_IFACE; вписать в host.conf.
+if clock_enabled && [ -z "$PROBE_PEERS" ]; then
+  die "PROBE_PEERS пуст -- адреса приёмников на управляющем интерфейсе ($MGMT_IFACE).
+   Посмотреть там: ip -4 -o addr show $MGMT_IFACE; вписать в host.conf
+   PROBE_PEERS=\"IP1 IP2 ...\" в том же порядке, что и PEERS.
    Либо CLOCK=0, чтобы не мерить смещение."
 fi
 
@@ -100,16 +115,21 @@ RUN=results/tx-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$RUN"
 rm -f /dev/shm/fanout_ring
 
-OFF_BEFORE=
+OFF_BEFORE=()
 if clock_enabled; then
   say "Смещение часов до прогона"
-  OFF_BEFORE=$(clock_probe_once "$RUN/clock.log")
-  [ -n "$OFF_BEFORE" ] || die "не удалось снять смещение -- запущен ли rx.sh
-   на приёмнике? Он поднимает отражатель. См. $RUN/clock.log"
-  row offset "$OFF_BEFORE нс"
-  # Отражатель на той стороне выходит через PROBE_IDLE_S тишины, и только после
-  # этого rx.sh переходит к самому прогону. Ждём его, иначе первые пакеты уйдут
-  # в ещё не поднятый приёмник.
+  i=0
+  while read -r peer off; do
+    [ -n "$off" ] || die "не удалось снять смещение до $peer -- запущен ли там rx.sh?
+   Он поднимает отражатель. См. $RUN/clock.log"
+    OFF_BEFORE[$i]=$off
+    row "$peer" "$off нс"
+    i=$((i + 1))
+  done < <(clock_probe_all "$RUN/clock.log" "${PROBE_LIST[@]}")
+  [ "$i" = "$NDEST" ] || die "снято смещений: $i из $NDEST, см. $RUN/clock.log"
+  # Отражатели выходят через PROBE_IDLE_S тишины, и только после этого rx.sh на
+  # той стороне переходит к самому прогону. Ждём последнего из них, иначе первые
+  # пакеты уйдут в ещё не поднятый приёмник.
   sleep $((PROBE_IDLE_S + 2))
 fi
 
@@ -128,19 +148,20 @@ cleanup() {
   tail -n 20 "$RUN/sender.log" 2>/dev/null || true
 
   # После прогона, а не после wait: останавливают tx.sh обычно по Ctrl+C.
-  if clock_enabled && [ -n "$OFF_BEFORE" ]; then
-    local after
-    after=$(clock_probe_once "$RUN/clock.log")
+  if clock_enabled && [ "${#OFF_BEFORE[@]}" != 0 ]; then
     echo
     say "Смещение часов после прогона"
-    row offset "${after:-?} нс"
-    if [ -n "$after" ]; then
-      row "ушло за прогон" "$(( after - OFF_BEFORE )) нс"
-      echo
-      echo "   на приёмнике:"
-      echo "   ./scripts/summarize.py results/rx-*/latencies.csv \\"
-      echo "       --offset $OFF_BEFORE --offset-end $after"
-    fi
+    local i=0 peer after
+    while read -r peer after; do
+      if [ -n "$after" ]; then
+        row "$peer" "$after нс, за прогон $(( after - OFF_BEFORE[i] )) нс"
+        echo "      там: ./scripts/summarize.py results/rx-*/latencies.csv \\"
+        echo "           --offset ${OFF_BEFORE[i]} --offset-end $after"
+      else
+        row "$peer" "замер не удался, см. $RUN/clock.log"
+      fi
+      i=$((i + 1))
+    done < <(clock_probe_all "$RUN/clock.log" "${PROBE_LIST[@]}")
   fi
 }
 trap cleanup EXIT
