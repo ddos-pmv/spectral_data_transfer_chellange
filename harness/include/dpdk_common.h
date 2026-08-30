@@ -599,16 +599,21 @@ class SenderPort {
     return rte_eth_tx_burst(port_id_, queue_id, pkts, n);
   }
 
-  // What the caller hands send_all(): one entry per queue that has packets.
+  // What the caller hands send_all(): one contiguous run of packets and the
+  // queue it goes to. The queue id is carried explicitly rather than inferred
+  // from the array index, so several batches may name the same queue -- that is
+  // what lets a caller keep one batch per destination even when destinations
+  // share a queue.
   struct QueueBatch {
     rte_mbuf** pkts = nullptr;
+    uint16_t queue_id = 0;
     uint16_t total = 0;
     uint16_t sent = 0;
   };
 
-  // One pass over every queue before retrying any. A per-queue retry loop would
-  // spin on queue 0 while queue 1's packets sit unsent, making one receiver pay
-  // for a full ring that is not even its own.
+  // One pass over every batch before retrying any. A per-batch retry loop would
+  // spin on the first while the second's packets sit unsent, making one receiver
+  // pay for a full ring that is not even its own.
   void send_all(QueueBatch* batches, uint16_t n_batches) const noexcept {
     uint32_t spins = 0;
     for (;;) {
@@ -616,7 +621,7 @@ class SenderPort {
       for (uint16_t q = 0; q < n_batches; ++q) {
         QueueBatch& b = batches[q];
         if (b.sent >= b.total) continue;
-        const uint16_t k = tx_burst(static_cast<uint16_t>(q), b.pkts + b.sent,
+        const uint16_t k = tx_burst(b.queue_id, b.pkts + b.sent,
                                     static_cast<uint16_t>(b.total - b.sent));
         b.sent = static_cast<uint16_t>(b.sent + k);
         if (b.sent < b.total) pending = true;

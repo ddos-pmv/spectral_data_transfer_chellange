@@ -191,14 +191,10 @@ void check_mempool_size(const Config& cfg, uint32_t n_dests, uint16_t n_queues) 
   }
 }
 
-// bufs[d][i] is destination d's packet for message i, so a destination's packets
-// are contiguous and the common case (a queue to itself) hands its array
-// straight to tx_burst with no gather.
+// bufs[d][i] is destination d's packet for message i. A destination's packets
+// are contiguous, so every destination hands its array straight to tx_burst --
+// no gather buffer and no interleaving, whether or not it shares a queue.
 rte_mbuf* g_bufs[kMaxDests][kMaxBurst];
-
-// Scratch for the shared-queue case only: destinations that share a queue are
-// merged into one array, message-major.
-rte_mbuf* g_gather[kMaxDests * kMaxBurst];
 
 struct DestStats {
   uint64_t sent = 0;
@@ -232,39 +228,6 @@ int main(int argc, char** argv) {
   const uint32_t n_dests = sender.n_dests();
   const uint16_t n_queues = sender.n_queues();
   check_mempool_size(cfg, n_dests, n_queues);
-
-  // Which destinations each queue carries, and where its slice of g_gather
-  // starts. Built once; the hot loop only walks it. With a queue per receiver
-  // every plan holds a single destination.
-  //
-  // Flat fixed arrays rather than vector<vector>: the hot loop reads this twice
-  // per burst (dispatch and refill), and through nested vectors each read is a
-  // chain of dependent loads -- the outer buffer, then the inner vector object,
-  // then its heap buffer, which may be anywhere -- before the destination index
-  // is even known. Here a plan is 32 bytes with no indirection at all, and two
-  // of them share a cache line.
-  //
-  // Indexing plans[] by queue id is safe because n_queues <= n_dests <=
-  // kMaxDests always: the port asks for one TX queue per destination and the
-  // device can only hand back fewer. batches[] below already relies on the same
-  // bound.
-  struct QueuePlan {
-    size_t gather_off = 0;          // this queue's slice of g_gather
-    uint32_t count = 0;             // destinations on this queue
-    uint8_t dests[kMaxDests] = {};  // kMaxDests is 16, so a byte each is plenty
-  };
-  QueuePlan plans[kMaxDests];
-
-  for (uint32_t d = 0; d < n_dests; ++d) {
-    QueuePlan& p = plans[sender.queue_of(d)];
-    p.dests[p.count++] = static_cast<uint8_t>(d);
-  }
-  // Queues can carry different numbers of destinations, so the gather offset is
-  // a running sum rather than q * something.
-  for (uint16_t q = 1; q < n_queues; ++q) {
-    plans[q].gather_off = plans[q - 1].gather_off +
-                          static_cast<size_t>(cfg.burst) * plans[q - 1].count;
-  }
 
   std::fprintf(stderr, "dpdk_sender: shm=%s, %u destination(s) over %u tx queue(s)\n",
                cfg.shm_name.c_str(), n_dests, static_cast<unsigned>(n_queues));
@@ -359,29 +322,27 @@ int main(int argc, char** argv) {
       }
     }
 
-    // --- hand every queue its packets --------------------------------------
-    for (uint16_t q = 0; q < n_queues; ++q) {
-      const QueuePlan& p = plans[q];
-      if (p.count == 1) {
-        // The queue-per-receiver case: already contiguous, nothing to gather.
-        batches[q].pkts = g_bufs[p.dests[0]];
-        batches[q].total = static_cast<uint16_t>(n);
-      } else {
-        // Shared queue: interleave message-major (m0d0, m0d1, m1d0, ...) so a
-        // receiver's k-th message trails another's by the destination count,
-        // not by the whole burst.
-        rte_mbuf** out = g_gather + p.gather_off;
-        uint32_t k = 0;
-        for (uint32_t i = 0; i < n; ++i) {
-          for (uint32_t j = 0; j < p.count; ++j) out[k++] = g_bufs[p.dests[j]][i];
-        }
-        batches[q].pkts = out;
-        batches[q].total = static_cast<uint16_t>(k);
-      }
-      batches[q].sent = 0;
+    // --- hand every destination its packets --------------------------------
+    // Destination-major: one batch per destination, its own array, in order.
+    // Nothing is gathered and nothing is interleaved, so the burst that goes to
+    // the card is the same array replicate() just filled.
+    //
+    // When destinations share a queue this changes the order on the wire: the
+    // whole burst for dest 0 precedes the whole burst for dest 1, instead of
+    // alternating. The last message of the last destination sits behind exactly
+    // as many packets either way -- the burst is the same size -- but an early
+    // message of a later destination now trails a full burst rather than one
+    // packet per destination ahead of it. That costs nothing while bursts are
+    // short, and bursts only grow when the ring is backing up, at which point
+    // the queueing dwarfs the ordering.
+    for (uint32_t d = 0; d < n_dests; ++d) {
+      batches[d].pkts = g_bufs[d];
+      batches[d].queue_id = sender.queue_of(d);
+      batches[d].total = static_cast<uint16_t>(n);
+      batches[d].sent = 0;
     }
 
-    sender.send_all(batches, n_queues);
+    sender.send_all(batches, static_cast<uint16_t>(n_dests));
 
     // --- account and refill -------------------------------------------------
     // tx_burst consumes a prefix, so for every destination the packets that went
@@ -389,22 +350,13 @@ int main(int argc, char** argv) {
     // mbufs) and get replaced; the unsent tail keeps its mbufs and is simply
     // refilled with new frames next iteration.
     bool refill_ok = true;
-    for (uint16_t q = 0; q < n_queues; ++q) {
-      const QueuePlan& p = plans[q];
-      const uint32_t stride = p.count;
-      const uint32_t sent = batches[q].sent;
-      for (uint32_t j = 0; j < stride; ++j) {
-        // In the interleaved layout destination j occupies positions
-        // j, j+stride, j+2*stride...; `sent` of them went out.
-        const uint32_t sent_d =
-            stride == 1 ? sent : sent / stride + ((sent % stride) > j ? 1u : 0u);
-        const uint32_t d = p.dests[j];
-        dstats[d].sent += sent_d;
-        dstats[d].dropped += n - sent_d;
-        if (!sender.alloc_bulk(g_bufs[d], sent_d)) [[unlikely]] {
-          ++alloc_fail;
-          refill_ok = false;
-        }
+    for (uint32_t d = 0; d < n_dests; ++d) {
+      const uint32_t sent_d = batches[d].sent;
+      dstats[d].sent += sent_d;
+      dstats[d].dropped += n - sent_d;
+      if (!sender.alloc_bulk(g_bufs[d], sent_d)) [[unlikely]] {
+        ++alloc_fail;
+        refill_ok = false;
       }
     }
     if (!refill_ok) break;
