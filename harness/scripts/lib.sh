@@ -32,6 +32,11 @@ fi
 
 # Значения по умолчанию ставим ПОСЛЕ конфига и через :-, поэтому файл
 # перебивает эти дефолты. Приоритет целиком: окружение > host.conf > дефолт.
+# af_packet -- локальный функциональный тест на veth, без реальной карты и
+# igb_uio/vfio. Числа в этом режиме ни при чём: LLQ, Write Combining и
+# PPS-квота ENI из RUN.md/RESULTS.md тут не воспроизводятся, это только
+# проверка "код доставляет данные", а не измерение задержки.
+DPDK_MODE=${DPDK_MODE:-pci}
 DPDK_IFACE=${DPDK_IFACE:-enp40s0}
 DPDK_PCI=${DPDK_PCI:-}
 DPDK_ENI_INDEX=${DPDK_ENI_INDEX:-1}
@@ -114,7 +119,7 @@ check_pool() {  # check_pool ИМЯ_ПУЛА ПУЛ ИМЯ_ОЧЕРЕДИ ДЕС
 dispatch() {
   local cmd=${1:-status}
   case $cmd in
-    status|apply|revert|bind|unbind) "cmd_$cmd" ;;
+    status|apply|revert|bind|unbind|up|down) "cmd_$cmd" ;;
     -h|--help) awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0" ;;
     *) die "не знаю команду '$cmd'; есть: $SUBCOMMANDS" ;;
   esac
@@ -142,6 +147,23 @@ eni_addrs() {
     return 0
   done
   return 1
+}
+
+# Печатает "MAC IP" интерфейса DPDK. В pci-режиме карта отдана DPDK и ядро её
+# не видит -- адрес берётся из метаданных инстанса (eni_addrs). В af_packet
+# интерфейс остаётся у ядра (это обычный veth), адрес читается напрямую.
+dpdk_addrs() {
+  case "$DPDK_MODE" in
+    af_packet)
+      local mac ip
+      mac=$(ip -o link show "$DPDK_IFACE" 2>/dev/null \
+            | awk '{for (i=1;i<=NF;i++) if ($i=="link/ether") print $(i+1)}')
+      ip=$(ip -4 -o addr show "$DPDK_IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+      [ -n "$mac" ] && [ -n "$ip" ] || return 1
+      echo "$mac $ip"
+      ;;
+    *) eni_addrs "$DPDK_ENI_INDEX" ;;
+  esac
 }
 
 # ------------------------------------------------------------------- PCI
@@ -202,18 +224,34 @@ expand_cpus() {
 # отправитель на старте скажет "TX descriptors: requested X, applyed Y" --
 # причина в этом, и в host.conf надо вписать Y.
 LLQ_POLICY=${LLQ_POLICY:-3}
-eal_dev() {
-  local pci; pci=$(resolve_pci 2>/dev/null) || pci=""
-  [ -n "$pci" ] || return 1
-  [ "$(pci_driver "$pci")" = "$DPDK_DRIVER" ] || return 1
-  if [ "$LLQ_POLICY" = "off" ]; then echo "-a $pci"; else echo "-a $pci,llq_policy=$LLQ_POLICY"; fi
+
+# af_packet: обычный Linux-интерфейс (veth) вместо PCI-карты, через
+# vdev net_af_packet. Отдельная явная ветка, а не подмена внутри pci-пути --
+# если DPDK_MODE не выставлен явно, поведение не должно тихо поменяться.
+AF_PACKET_QUEUES=${AF_PACKET_QUEUES:-1}
+eal_dev_af_packet() {
+  [ -n "$DPDK_IFACE" ] || return 1
+  ip link show "$DPDK_IFACE" >/dev/null 2>&1 || return 1
+  echo "--no-pci --vdev=net_af_packet0,iface=$DPDK_IFACE,qpairs=$AF_PACKET_QUEUES,blocksize=4096,framesize=2048,framecount=512"
 }
 
-# IP той карты, через которую реально идёт трафик. VPC режет пакеты, у которых
-# src IP не совпадает с адресом ENI, так что брать адрес с соседней нельзя.
-# Карта отдана DPDK, ядро её не видит -- адрес берётся только из IMDS.
+eal_dev() {
+  case "$DPDK_MODE" in
+    af_packet) eal_dev_af_packet ;;
+    *)
+      local pci; pci=$(resolve_pci 2>/dev/null) || pci=""
+      [ -n "$pci" ] || return 1
+      [ "$(pci_driver "$pci")" = "$DPDK_DRIVER" ] || return 1
+      if [ "$LLQ_POLICY" = "off" ]; then echo "-a $pci"; else echo "-a $pci,llq_policy=$LLQ_POLICY"; fi
+      ;;
+  esac
+}
+
+# IP той карты, через которую реально идёт трафик. В pci-режиме карта отдана
+# DPDK, ядро её не видит, и VPC режет пакеты с src IP не с адреса ENI --
+# адрес только из IMDS. В af_packet интерфейс обычный, адрес виден ядру.
 local_ip() {
-  eni_addrs "$DPDK_ENI_INDEX" 2>/dev/null | awk '{print $2}'
+  dpdk_addrs 2>/dev/null | awk '{print $2}'
 }
 
 # ---------------------------------------------------------------- igb_uio

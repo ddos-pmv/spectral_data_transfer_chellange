@@ -188,7 +188,11 @@ if clock_enabled && [ -z "$PROBE_PEERS" ]; then
    Либо CLOCK=0, чтобы не мерить смещение."
 fi
 
-DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind"
+if [ "$DPDK_MODE" = af_packet ]; then
+  DEV=$(eal_dev) || die "интерфейса $DPDK_IFACE нет -- sudo ./scripts/veth_setup.sh up"
+else
+  DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind"
+fi
 SRC_IP=${SRC_IP:-$(local_ip)}
 [ -n "$SRC_IP" ] || die "не определить свой IP -- задайте SRC_IP=..."
 
