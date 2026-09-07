@@ -5,6 +5,9 @@
 #   sudo WITH_IGB_UIO=0 ./scripts/build.sh   # не собирать igb_uio
 #   sudo REBUILD=1 ./scripts/build.sh        # пересобрать, даже если DPDK стоит
 #
+#   # локальный функциональный тест на veth (см. veth_setup.sh), без карты:
+#   sudo WITH_IGB_UIO=0 EXTRA_DRIVERS=net/af_packet REBUILD=1 ./scripts/build.sh
+#
 # REBUILD=1 нужен после СМЕНЫ ТИПА ИНСТАНСА. Сборка идёт с -Dplatform=native,
 # то есть под конкретный CPU, и при переезде (скажем, Sapphire Rapids -> Ice
 # Lake) старые бинарники падают по SIGILL. Обычная проверка "DPDK уже стоит"
@@ -19,6 +22,9 @@ DPDK_REPO=${DPDK_REPO:-https://github.com/DPDK/dpdk-stable.git}
 DPDK_VER=${DPDK_VER:-v25.11.2}
 SRC=${SRC:-/opt/src}
 WITH_IGB_UIO=${WITH_IGB_UIO:-1}
+# Пусто -- только net/ena (прод). net/af_packet -- для локального теста на
+# veth, реальной карте он не нужен и в обычную сборку не идёт.
+EXTRA_DRIVERS=${EXTRA_DRIVERS:-}
 LIBDIR=/usr/local/lib/x86_64-linux-gnu
 
 need_root
@@ -49,8 +55,12 @@ else
 
   # Только net_ena: решение работает на ENA и ни на чём другом, а каждый лишний
   # драйвер -- это и время сборки, и лишний .so, который EAL будет открывать.
+  # EXTRA_DRIVERS добавляет к этому списку явно (для локального теста на veth,
+  # net/af_packet) -- по умолчанию пусто, прод-сборку не трогает.
+  DRIVERS=net/ena
+  [ -n "$EXTRA_DRIVERS" ] && DRIVERS="$DRIVERS,$EXTRA_DRIVERS"
   meson setup build --prefix=/usr/local -Dplatform=native -Dbuildtype=release \
-        -Denable_drivers=net/ena -Dtests=false
+        -Denable_drivers="$DRIVERS" -Dtests=false
   ninja -C build
 
   # Старые PMD сносятся ПОСЛЕ успешной сборки и перед установкой, а не раньше:
