@@ -44,13 +44,21 @@
 
 ## ВАЖНО: на чём мерили и как настроить под другой инстанс
 
+> Везде ниже и в [RESULTS.md](RESULTS.md) `PACK` и `MIN_PACK` упоминаются как
+> две раздельные ручки — так было устроено во время замеров. По их же итогам
+> (раздел «Что уменьшает хвост» ниже) хвост всегда выходил меньше при
+> `PACK = MIN_PACK`, второй режим ни разу не пригодился как самостоятельный, и
+> интерфейс отправителя с тех пор ужат до одного `--pack`/`PACK`, который
+> всегда означает "ровно столько, принудительно". Числа и выводы не менялись —
+> изменилось только название ручки в текущем коде.
+
 Все числа сняты на **c6in** (отправитель `c6in.2xlarge`, приёмники
 `c6in.2xlarge` + 3x `c6in.xlarge`, одна подсеть VPC, placement group).
 
-**На другом инстансе подберите `PACK` и `MIN_PACK` заново.** Это не тонкая
-настройка, а главная ручка решения, и её правильное значение — свойство
-конкретной пары хостов, а не константа кода. Умолчание (`PACK=1`) выключает
-батчинг совсем и даёт поведение «пакет на сообщение».
+**На другом инстансе подберите `PACK` заново.** Это не тонкая настройка, а
+главная ручка решения, и её правильное значение — свойство конкретной пары
+хостов, а не константа кода. Умолчание (`PACK=1`) выключает батчинг совсем и
+даёт поведение «пакет на сообщение».
 
 Настраивать надо от двух измеримых величин, обе снимаются за пару прогонов:
 
@@ -468,8 +476,10 @@ switch (n_dests) {
 холодные ветки из I-кэша.
 
 ```bash
-make CXXFLAGS="... -fprofile-generate"   # прогон под нагрузкой
-make CXXFLAGS="... -fprofile-use -fprofile-correction"
+cmake -S . -B build-pgo -DCMAKE_CXX_FLAGS="-fprofile-generate"
+cmake --build build-pgo -j$(nproc)        # прогон под нагрузкой
+cmake -S . -B build-pgo -DCMAKE_CXX_FLAGS="-fprofile-use -fprofile-correction"
+cmake --build build-pgo -j$(nproc)
 ```
 
 **Чего ждать.** Средние значения не сдвинутся заметно, но у PGO есть механизм,
@@ -540,14 +550,21 @@ I-кэша, и первый пакет после простоя платит з
 
 ```bash
 # на каждой машине, один раз
-./scripts/build.sh && sudo ./scripts/host.sh apply && ./scripts/checkenv.sh
+sudo ./scripts/build.sh
+cmake -S . -B build && cmake --build build -j$(nproc)
+sudo ./scripts/host.sh apply && ./scripts/checkenv.sh
 
 # приёмники (первыми)
 sudo CPU_RECEIVER=1 CPU_CONSUMER=2 COUNT=6000000 WARMUP=1000000 ./scripts/rx.sh
 
 # отправитель
-sudo RECEIVERS=4 RATE=1000000 BURST=10 PACK=8 MIN_PACK=4 ./scripts/tx.sh
+sudo RECEIVERS=4 RATE=1000000 BURST=10 PACK=8 ./scripts/tx.sh
 ```
+
+(Исторически этот прогон снимался с раздельными `PACK=8 MIN_PACK=4` — см.
+оговорку в начале раздела «на чём мерили» выше: по тем же замерам равные
+значения не хуже, а в хвосте лучше, так что `PACK=8` воспроизводит ровно тот
+случай.)
 
 `tx.sh` печатает готовую команду `summarize.py` с поправкой часов для каждого
 получателя. Подробности, значения по умолчанию и настройка машины — [RUN.md](RUN.md).
@@ -559,7 +576,7 @@ sudo RECEIVERS=4 RATE=1000000 BURST=10 PACK=8 MIN_PACK=4 ./scripts/tx.sh
 sudo REORDER=64 CPU_RECEIVER=1 CPU_CONSUMER=2 COUNT=2000000 WARMUP=400000 ./scripts/rx.sh
 
 # отправитель: поток размазан по 4 очередям -> bin/dpdk_sender_mq
-sudo RECEIVERS=1 RATE=800000 BURST=32 PACK=8 MIN_PACK=8 DEST_QUEUES=4 ./scripts/tx.sh
+sudo RECEIVERS=1 RATE=800000 BURST=32 PACK=8 DEST_QUEUES=4 ./scripts/tx.sh
 ```
 
 `REORDER=0` и `DEST_QUEUES=1` (умолчания) выбирают основные бинарники, и путь

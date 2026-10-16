@@ -326,7 +326,7 @@ clock_enabled() { [ "$CLOCK" = 1 ]; }
 
 clock_check() {
   clock_enabled || return 0
-  [ -x "$PROBE" ] || die "нет $PROBE -- make -j$(nproc)   (или CLOCK=0)"
+  [ -x "$PROBE" ] || die "нет $PROBE -- cmake --build build -j$(nproc)   (или CLOCK=0)"
   systemctl stop chrony 2>/dev/null || true
 }
 

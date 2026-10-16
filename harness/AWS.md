@@ -502,7 +502,7 @@ sleep 30 && chronyc sources -v && chronyc tracking
 
 ```bash
 git clone <репозиторий> && cd <репозиторий>/harness
-make -j$(nproc)
+cmake -S . -B build && cmake --build build -j$(nproc)
 ls bin/          # producer consumer dpdk_sender dpdk_reciever dpdk_probe
 ```
 

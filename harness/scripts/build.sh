@@ -102,7 +102,8 @@ row "DPDK" "$(pkg-config --modversion libdpdk)"
 cat <<'NEXT'
 
    Дальше:
-     make -j$(nproc)                          собрать проект
+     cmake -S . -B build                      сконфигурировать (разово)
+     cmake --build build -j$(nproc)            собрать проект
      cp scripts/host.conf.example scripts/host.conf && $EDITOR scripts/host.conf
      sudo ./scripts/host.sh apply             настроить машину
      ./scripts/checkenv.sh                    что осталось (GRUB, часы)

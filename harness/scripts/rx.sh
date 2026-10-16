@@ -45,7 +45,7 @@ else
   RECEIVER_BIN=bin/dpdk_reciever_ro
   REORDER_ARGS="--reorder $REORDER"
 fi
-[ -x "$RECEIVER_BIN" ] || die "нет $RECEIVER_BIN -- make -j\$(nproc)"
+[ -x "$RECEIVER_BIN" ] || die "нет $RECEIVER_BIN -- cmake --build build -j\$(nproc)"
 if [ "$DPDK_MODE" = af_packet ]; then
   DEV=$(eal_dev) || die "интерфейса $DPDK_IFACE нет -- sudo ./scripts/veth_setup.sh up"
 else

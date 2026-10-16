@@ -11,7 +11,7 @@ Security group второй ENI должна пропускать UDP/40001 от
 ```bash
 git clone <репозиторий> && cd <репозиторий>/harness
 sudo ./scripts/build.sh
-make -j$(nproc)
+cmake -S . -B build && cmake --build build -j$(nproc)
 ```
 
 ## 2. Параметры ядра
