@@ -1,0 +1,6 @@
+# Google C++ style, но табы вместо пробелов: ширина табуляции -- 4 колонки
+# (у Google по умолчанию 2 пробела без табов).
+BasedOnStyle: Google
+UseTab: Always
+IndentWidth: 4
+TabWidth: 4

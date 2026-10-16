@@ -72,7 +72,7 @@ for b in producer consumer dpdk_sender dpdk_reciever; do
   if [ -x "bin/$b" ]; then
     ok "bin/$b"
   else
-    note "bin/$b нет -- make -j\$(nproc)"
+    note "bin/$b нет -- cmake --build build -j\$(nproc)"
   fi
 done
 

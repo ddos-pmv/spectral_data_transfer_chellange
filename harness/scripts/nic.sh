@@ -11,7 +11,14 @@ set -euo pipefail
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
 SUBCOMMANDS="status bind unbind"
 
+not_pci_mode() {
+  [ "$DPDK_MODE" = pci ] && return 1
+  warn "DPDK_MODE=$DPDK_MODE -- карты тут нет, это veth. См. ./scripts/veth_setup.sh"
+  return 0
+}
+
 cmd_status() {
+  if not_pci_mode; then return 0; fi
   say "Карта DPDK"
   local pci drv
   if ! pci=$(resolve_pci); then
@@ -84,6 +91,7 @@ wc_status() {
 
 cmd_bind() {
   need_root bind
+  not_pci_mode && die "nic.sh bind не нужен в DPDK_MODE=af_packet"
   local pci drv
   pci=$(resolve_pci) || die "PCI не определить: впишите DPDK_PCI в host.conf"
   drv=$(pci_driver "$pci")
@@ -110,6 +118,7 @@ cmd_bind() {
 
 cmd_unbind() {
   need_root unbind
+  not_pci_mode && die "nic.sh unbind не нужен в DPDK_MODE=af_packet"
   local pci
   pci=$(resolve_pci) || die "PCI не определить: впишите DPDK_PCI в host.conf"
   [ "$(pci_driver "$pci")" = "$KERNEL_DRIVER" ] && { ok "уже у ядра"; return 0; }

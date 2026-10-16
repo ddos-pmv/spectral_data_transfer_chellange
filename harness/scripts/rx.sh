@@ -45,13 +45,17 @@ else
   RECEIVER_BIN=bin/dpdk_reciever_ro
   REORDER_ARGS="--reorder $REORDER"
 fi
-[ -x "$RECEIVER_BIN" ] || die "нет $RECEIVER_BIN -- make -j\$(nproc)"
-DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind"
+[ -x "$RECEIVER_BIN" ] || die "нет $RECEIVER_BIN -- cmake --build build -j\$(nproc)"
+if [ "$DPDK_MODE" = af_packet ]; then
+  DEV=$(eal_dev) || die "интерфейса $DPDK_IFACE нет -- sudo ./scripts/veth_setup.sh up"
+else
+  DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind"
+fi
 
-# Печатаем адреса той карты, которую слушает DPDK: ядру она не видна, и MAC с
-# IP взять больше неоткуда, кроме метаданных инстанса.
+# Печатаем адреса той карты, которую слушает DPDK. В pci-режиме ядру она не
+# видна, и MAC с IP взять больше неоткуда, кроме метаданных инстанса.
 say "Вписать в host.conf отправляющей машины"
-if ADDRS=$(eni_addrs "$DPDK_ENI_INDEX"); then
+if ADDRS=$(dpdk_addrs); then
   row PEER_MAC "$(awk '{print $1}' <<<"$ADDRS")"
   row PEER_IP "$(awk '{print $2}' <<<"$ADDRS")"
 else

@@ -18,7 +18,7 @@ harness/
   src/
     producer.cpp   generates events, stamps seq_id + send_ts_ns, publishes to ring
     consumer.cpp   reads ring, stamps recv_ts, computes metrics
-  Makefile
+  CMakeLists.txt
 ```
 
 ## Message format
@@ -53,8 +53,13 @@ It is deliberately the simplest thing that behaves like a realistic market-data 
 ## Build
 
 ```bash
-make          # builds bin/producer and bin/consumer
+cmake -S . -B build        # configure (once)
+cmake --build build -j$(nproc)   # builds bin/producer, bin/consumer, and the rest
 ```
+
+DPDK targets (`dpdk_sender`, `dpdk_reciever`, ...) are added automatically when
+`libdpdk` is discoverable via `pkg-config`; otherwise the configure step just
+skips them and the plain binaries above still build.
 
 ## Run the baseline (one host)
 
