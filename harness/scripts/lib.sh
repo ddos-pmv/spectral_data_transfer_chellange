@@ -232,7 +232,17 @@ AF_PACKET_QUEUES=${AF_PACKET_QUEUES:-1}
 eal_dev_af_packet() {
   [ -n "$DPDK_IFACE" ] || return 1
   ip link show "$DPDK_IFACE" >/dev/null 2>&1 || return 1
-  echo "--no-pci --vdev=net_af_packet0,iface=$DPDK_IFACE,qpairs=$AF_PACKET_QUEUES,blocksize=4096,framesize=2048,framecount=512"
+  # Имена devarg у net_af_packet сокращённые -- blocksz/framesz/framecnt, НЕ
+  # blocksize/framesize/framecount. С полными именами rte_kvargs_parse не
+  # узнаёт ключи, probe проваливается до открытия AF_PACKET-сокета молча --
+  # EAL говорит только "no available Ethernet devices", без причины.
+  #
+  # promisc сюда не ставим: generic ethdev-слой DPDK сбрасывает его на старте
+  # порта к своему дефолту (выкл) независимо от состояния интерфейса снаружи --
+  # ip link ... promisc on здесь не пережил бы rte_eth_dev_start(). Поэтому
+  # promisc включается изнутри самого приёмника, флагом --promisc (rx.sh сам
+  # добавляет его при DPDK_MODE=af_packet); см. комментарий в dpdk_reciever.cpp.
+  echo "--no-pci --vdev=net_af_packet0,iface=$DPDK_IFACE,qpairs=$AF_PACKET_QUEUES,blocksz=4096,framesz=2048,framecnt=512"
 }
 
 eal_dev() {

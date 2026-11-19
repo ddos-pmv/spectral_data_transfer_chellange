@@ -53,6 +53,7 @@ struct Config {
 	uint16_t rxd = 2048;
 	uint16_t mtu = 1500;  // должен быть НЕ МЕНЬШЕ, чем у отправителя
 	uint32_t reorder = 0;  // кадров в окне переупорядочивания; 0 = выключено
+	bool promisc = false;  // только af_packet/veth, см. dpdk_reciever.cpp
 };
 
 Config parse_args(int argc, char** argv) {
@@ -82,6 +83,8 @@ Config parse_args(int argc, char** argv) {
 			c.reorder = static_cast<uint32_t>(std::stoul(next()));
 		else if (a == "--rxd")
 			c.rxd = static_cast<uint32_t>(std::stoul(next()));
+		else if (a == "--promisc")
+			c.promisc = true;
 		else {
 			std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
 			std::exit(2);
@@ -152,6 +155,8 @@ int main(int argc, char** argv) {
 	dpdk::ReceiverPort receiver("receiver_ro_pool", cfg.nb_mbufs,
 								cfg.cache_size,
 								/*nb_rxd=*/cfg.rxd, cfg.mtu);
+
+	if (cfg.promisc) rte_eth_promiscuous_enable(receiver.port_id());
 
 	RingHandle out = create_output_ring(cfg.shm_name, cfg.slots);
 

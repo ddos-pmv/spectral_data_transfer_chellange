@@ -34,8 +34,37 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
   build-essential git pkg-config meson ninja-build python3-pyelftools \
-  libnuma-dev libbpf-dev libxdp-dev ethtool chrony pciutils \
-  linux-headers-"$(uname -r)" linux-tools-"$(uname -r)" linux-tools-common
+  libnuma-dev libbpf-dev ethtool chrony pciutils
+
+# libxdp-dev нужен только net/af_xdp, который в DRIVERS по умолчанию не
+# запрашивается никем. На Ubuntu 20.04 (focal) пакета просто нет ни в одном
+# репозитории -- apt упал бы здесь же, до всякого DPDK, даже когда af_xdp не
+# нужен. Ставим только если его явно просят через EXTRA_DRIVERS.
+case "$EXTRA_DRIVERS" in
+  *af_xdp*) apt-get install -y -qq libxdp-dev ;;
+esac
+
+# linux-headers/-tools нужны только igb_uio: собирается из исходников против
+# заголовков РАБОТАЮЩЕГО ядра. На af_packet (WITH_IGB_UIO=0) это лишняя
+# зависимость, и на нестандартном ядре (контейнер, LinuxKit, самосборное) её
+# просто нет в репозиториях -- apt упал бы здесь же, до всякого DPDK.
+if [ "$WITH_IGB_UIO" = 1 ]; then
+  apt-get install -y -qq \
+    linux-headers-"$(uname -r)" linux-tools-"$(uname -r)" linux-tools-common
+fi
+
+# DPDK $DPDK_VER требует meson >= 0.57.2. На Ubuntu 24.04 это не проблема, но
+# на Ubuntu 20.04 (focal) apt даёт 0.53.2 -- meson.build откажется
+# конфигурироваться ещё до компиляции. Апгрейд через pip -- путь, который сам
+# DPDK рекомендует для дистрибутивов со старым meson.
+MESON_MIN=0.57.2
+if ! dpkg --compare-versions "$(meson --version)" ge "$MESON_MIN"; then
+  say "meson $(meson --version) старее $MESON_MIN -- апгрейжу через pip"
+  apt-get install -y -qq python3-pip >/dev/null
+  pip3 install -q -U "meson>=$MESON_MIN"
+  hash -r   # иначе bash продолжит находить старый /usr/bin/meson по кэшу PATH
+  say "meson теперь $(meson --version)"
+fi
 
 REBUILD=${REBUILD:-0}
 if [ "$REBUILD" = 0 ] && pkg-config --exists libdpdk 2>/dev/null; then

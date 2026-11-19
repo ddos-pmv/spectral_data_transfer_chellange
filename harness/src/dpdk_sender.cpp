@@ -1,78 +1,3 @@
-// dpdk_sender: reads frames from the producer's shared-memory ring and
-// transmits them as raw UDP/IPv4/Ethernet packets to every receiver in the
-// destination table.
-//
-// Fan-out is source replication because a VPC does not forward IP multicast
-// between instances. The table is written so one row holding a group address is
-// a genuine multicast send wherever the fabric does replicate; with N unicast
-// rows the sender pays N packets per message, and that ceiling is what the
-// per-queue counters at exit are for.
-//
-// One thread. Replication multiplies the per-packet cost but not the per-burst
-// cost: the shm ring is read once per message however many receivers there are.
-// A second core would not reduce the packet count, which is the actual limit.
-//
-// Never auto-exits on idle: it is transport infrastructure, not a reporting
-// tool. Stop it with Ctrl+C / SIGTERM.
-//
-// Usage:
-//   dpdk_sender [EAL args] -- --shm NAME --slots N --src-ip IP
-//               --dest MAC@IP:PORT [--dest ...]
-//               [--src-port P] [--burst N] [--pack N]
-//               [--pack-wait-spins N] [--pack-backoff N]
-//               [--mbufs N] [--txd N] [--count N]
-//               [--tx-queues N] [--tx-spins N]
-//
-// Две независимые границы прохода:
-//   --burst N -- сколько ДАТАГРАММ уходит в карту за один rte_eth_tx_burst.
-//   --pack N  -- сколько СООБЩЕНИЙ едет в ОДНОЙ датаграмме, принудительно.
-// То есть за проход до burst*pack сообщений. Приёмник разбирает кадры по
-// frame_size(type) из заголовка каждого, так что на провод не добавляется ни
-// байта служебных данных.
-//
-// --pack 1 (по умолчанию) -- каждое сообщение своей датаграммой, ожидания нет
-// вовсе: цикл закрывает датаграмму сразу по первому прочитанному кадру.
-//
-// --pack N > 1 -- ПРИНУДИТЕЛЬНЫЙ батчинг: не отправлять датаграмму короче N
-// кадров, даже если кольцо пусто. Раньше это было двумя ручками (--pack как
-// мягкий потолок без ожидания и отдельное --min-pack для принудительного
-// добора); замеры показали, что хвост меньше именно когда они равны (второй
-// режим размера датаграммы при pack > min_pack только расширяет распределение
-// отрезка a), так что сейчас --pack один и всегда означает "ровно N, подождать
-// если нужно". Ждать бесконечно нельзя: пауза в потоке становится задержкой
-// первого кадра один к одному, а паузы редки и потому попадают прямо в p99.9
-// и p99.99.
-//
-// Предел -- счётчик холостых опросов кольца, --pack-wait-spins, один на весь
-// проход. Оборот -- чтение пустого слота, стоимость почти постоянная (замерено
-// ~0.7 нс), так что счётчик оборотов и есть ограничение по времени в других
-// единицах; clock_gettime на каждом обороте обошёлся бы дороже ожидания.
-// Выбирать надо от темпа: добрать N кадров при R сообщений в секунду занимает
-// ~N/R секунд, то есть при 400k msg/s четыре кадра -- ~7.5 мкс, ~10000
-// оборотов. Меньший предел просто никогда не даст добрать -- это покажет
-// pack_timeout.
-//
-// --pack-backoff N -- холостых оборотов МЕЖДУ опросами кольца, пока идёт добор.
-// 0 (по умолчанию) -- опрашивать вплотную, путь тот же, что был.
-//
-// Смысл не в экономии тактов. Повторные acquire-load слота, лежащего в S,
-// попадают в L1 и когерентного трафика не создают; платится в момент, когда
-// producer делает release-store: линия инвалидируется, а у нас в полёте десятки
-// спекулятивных загрузок именно её -- это memory-ordering machine clear, сброс
-// конвейера. Реже опрашиваем -- меньше загрузок в полёте к этому моменту.
-//
-// Отправку задержка не сдвигает: момент отправки определяет producer, выдавший
-// последний кадр, а не то, когда мы этот кадр заметили. Пока задержка короче
-// наполнения (~9 мкс при pack 8 и 800k msg/s), она бесплатна. Поэтому она и
-// стоит только здесь, а не в общей ветке пустого кольца.
-//
-// Оборот замерен в 0.51 нс. Учтите, что он растягивает и бюджет ожидания:
-// pack_wait_spins считает итерации, а итерация теперь стоит ~2.2 + 0.51*backoff
-// нс.
-//
-// --tx-queues caps the queue count (default: one per destination). Setting it
-// to 1 puts every receiver on one queue -- the comparison that says whether a
-// queue per receiver was worth it.
 #include <rte_eal.h>
 #include <rte_mbuf.h>
 
@@ -129,9 +54,7 @@ struct Config {
 	std::vector<dpdk::DestSpec> dests;
 };
 
-// An unsigned argument, or a clean exit. from_chars reports a bad value instead
-// of throwing the way stoul does, and the trailing-character check rejects
-// "40001x", which stoul would happily accept.
+// An unsigned argument, or a clean exit.
 uint32_t parse_uint(const char* flag, const std::string& v, uint64_t max) {
 	uint64_t out = 0;
 	const char* last = v.data() + v.size();
@@ -364,25 +287,12 @@ int main(int argc, char** argv) {
 
 	dpdk::SenderPort::prefetch_packet(g_bufs[0][0]);
 	while (!g_stop && (cfg.count == 0 || msgs < cfg.count)) {
-		// --- drain the ring into destination 0's mbufs
-		// ------------------------- One read per message regardless of the
-		// receiver count: this is the copy that crosses cores (the producer
-		// wrote that cache line), and it is the expensive one. The other
-		// receivers are served from the result below.
-		//
-		// Проход собирает до cfg.burst датаграмм по cfg.pack кадров. Состояние
-		// текущей датаграммы живёт между витками, и закрывается она там, где
-		// это выясняется: набралась до pack, либо кольцо иссякло.
 		uint32_t n = 0;		  // датаграмм собрано
 		uint32_t n_msgs = 0;  // сообщений в них
 		uint16_t used = 0;	  // байт в текущей датаграмме
 		uint16_t frames = 0;  // кадров в ней
 		uint32_t wait_spins = 0;
 
-		// Место под ещё один кадр держится инвариантом frames < cfg.pack на
-		// входе в чтение: датаграмма закрывается сразу по достижении предела,
-		// поэтому used <= (pack-1)*kFrameCap, и после записи <= pack*kFrameCap
-		// = kMaxPayload.
 		auto close_dgram = [&]() {
 			lens[n] = used;
 			sender.finalize(g_bufs[0][n], /*dest_idx=*/0, used);
@@ -417,15 +327,10 @@ int main(int argc, char** argv) {
 				continue;
 			}
 
-			// kEmpty: кольцо пусто. При --pack 1 отправляем что набралось --
-			// именно это и есть отказ платить задержкой за батчинг.
+
 			++empty_spins;
 			if (frames > 0 && frames < cfg.pack && !g_stop) {
 				if (++wait_spins < cfg.pack_wait_spins) {
-					// Ждать мы всё равно будем: момент отправки задаёт
-					// producer, а не то, когда мы заметим кадр. Пока задержка
-					// короче наполнения, она не сдвигает отправку вовсе -- и
-					// только здесь она поэтому и уместна.
 					dpdk::idle_spin(cfg.pack_backoff);
 					continue;
 				}
@@ -474,14 +379,6 @@ int main(int argc, char** argv) {
 			}
 		}
 
-		// --- hand every destination its packets
-		// -------------------------------- Destination-major: one batch per
-		// destination, its own array, in order. Nothing is gathered and nothing
-		// is interleaved, so the burst handed to the card is the same array
-		// replicate() just filled. When destinations share a queue this puts
-		// dest 0's whole burst ahead of dest 1's instead of alternating; the
-		// last message waits behind the same number of packets either way, and
-		// bursts only grow when the ring is already backing up.
 		for (uint32_t d = 0; d < n_dests; ++d) {
 			batches[d].pkts = g_bufs[d];
 			batches[d].queue_id = sender.queue_of(d);

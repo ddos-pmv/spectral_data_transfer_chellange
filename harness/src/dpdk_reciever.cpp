@@ -5,6 +5,18 @@
 //
 // Usage:
 //   dpdk_receiver [EAL args] -- --shm NAME --slots N [--port P] [--burst N]
+//                 [--promisc]
+//
+// --promisc -- только для af_packet/veth-теста. Дженерик ethdev-слой DPDK
+// сбрасывает promiscuous к дефолту (выкл) на старте порта независимо от
+// того, что было выставлено снаружи (ip link ... promisc on) -- на veth-паре
+// между Docker-контейнерами без него ядро не доставляет в AF_PACKET-сокет
+// юникаст-кадры, адресованные даже ровно в MAC интерфейса (tcpdump их видит
+// только потому, что сам включает promisc при открытии захвата). На реальной
+// ENA это не нужно: прямая доставка юникаста уже работает без него, а лишние
+// кадры в promiscuous -- это CPU на их отбраковку прямо в измеряемом пути.
+// Поэтому флаг явный и по умолчанию выключен -- путь, на котором сняты числа
+// в RESULTS.md, не трогается ни байтом без него.
 #include <rte_eal.h>
 #include <rte_mbuf.h>
 
@@ -36,6 +48,7 @@ struct Config {
 	uint32_t cache_size = 256;
 	uint16_t rxd = 2048;
 	uint16_t mtu = 1500;  // должен быть НЕ МЕНЬШЕ, чем у отправителя
+	bool promisc = false;  // только af_packet/veth, см. комментарий наверху файла
 };
 
 Config parse_args(int argc, char** argv) {
@@ -63,6 +76,8 @@ Config parse_args(int argc, char** argv) {
 			c.mtu = static_cast<uint16_t>(std::stoul(next()));
 		else if (a == "--rxd")
 			c.rxd = static_cast<uint32_t>(std::stoul(next()));
+		else if (a == "--promisc")
+			c.promisc = true;
 		else {
 			std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
 			std::exit(2);
@@ -118,6 +133,11 @@ int main(int argc, char** argv) {
 
 	dpdk::ReceiverPort receiver("receiver_pool", cfg.nb_mbufs, cfg.cache_size,
 								/*nb_rxd=*/cfg.rxd, cfg.mtu);
+
+	// После dev_start, не до: ethdev выставляет promiscuous сам по себе
+	// описанию порта, а не по тому, что было на интерфейсе снаружи -- вызов
+	// раньше старта ничего не изменит.
+	if (cfg.promisc) rte_eth_promiscuous_enable(receiver.port_id());
 
 	RingHandle out = create_output_ring(cfg.shm_name, cfg.slots);
 

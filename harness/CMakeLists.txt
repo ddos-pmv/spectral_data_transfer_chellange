@@ -11,9 +11,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Бинарники всегда лежат в harness/bin -- на этот путь жёстко рассчитаны все
-# scripts/*.sh (RECEIVER_BIN=bin/dpdk_reciever и т.п.), независимо от того, из
-# какого каталога собиралось (build/, build-pgo/, ...).
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 
 # Глобальные флаги оптимизации для всех исполняемых файлов
@@ -21,20 +18,16 @@ add_compile_options(-O3 -march=native -g -fno-omit-frame-pointer -Wall -Wextra)
 
 # Глобальные флаги диагностики unrolling в зависимости от компилятора
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    # Успехи, пропуски и подробный анализ причин для Clang
     add_compile_options(-Rpass=loop-unroll -Rpass-missed=loop-unroll -Rpass-analysis=loop-unroll)
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # Абсолютно вся информация по оптимизации циклов для GCC
     add_compile_options(-fopt-info-loop-all)
 endif()
 
+include(CheckIPOSupported)
+
 find_package(Threads REQUIRED)
-# shm_open/shm_unlink; на части современных систем уже часть libc и отдельной
-# библиотеки не имеет -- линкуем, только если find_library её нашла.
 find_library(RT_LIBRARY rt)
 
-# Один бинарник харнесса: include/ в путях поиска, -lpthread (-lrt, если есть)
-# -- то же самое, что раньше было LDLIBS в Makefile.
 function(add_harness_binary name)
     add_executable(${name} ${ARGN})
     target_include_directories(${name} PRIVATE include)
@@ -42,10 +35,16 @@ function(add_harness_binary name)
     if(RT_LIBRARY)
         target_link_libraries(${name} PRIVATE ${RT_LIBRARY})
     endif()
+
+
+    # lto setup
+    check_ipo_supported(RESULT LTO_SUPPORTED)
+    if (LTO_SUPPORTED)
+        set_property(TARGET ${name} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif ()
 endfunction()
 
 # --- Бинарники, не требующие DPDK -- собираются всегда ---
-
 add_harness_binary(producer src/producer.cpp)
 add_harness_binary(consumer src/consumer.cpp)
 add_harness_binary(sender   src/sender.cpp)
@@ -55,10 +54,6 @@ add_harness_binary(receiver src/receiver.cpp)
 add_harness_binary(clock_probe src/clock_probe.cpp)
 
 # --- DPDK-транспорт -- опционально ---
-#
-# На машине без libdpdk (и даже без самого pkg-config) пять бинарников выше
-# всё равно должны собраться как рабочий UDP-baseline, а не свалить всю
-# конфигурацию -- поэтому find_package(PkgConfig) без REQUIRED.
 find_package(PkgConfig)
 if(PkgConfig_FOUND)
     pkg_check_modules(DPDK IMPORTED_TARGET libdpdk)
@@ -69,10 +64,6 @@ if(DPDK_FOUND)
 
     function(add_dpdk_binary name)
         add_harness_binary(${name} ${ARGN})
-        # Динамическая линковка намеренно: драйверы (net_af_xdp, net_ena)
-        # живут отдельными .so и подгружаются EAL'ом в рантайме, в бинарь не
-        # попадают -- pkg-config сам отдаёт нужные -march=native и
-        # -include rte_config.h.
         target_link_libraries(${name} PRIVATE PkgConfig::DPDK)
     endfunction()
 
@@ -82,12 +73,8 @@ if(DPDK_FOUND)
     add_dpdk_binary(dpdk_sender   src/dpdk_sender.cpp)
     add_dpdk_binary(dpdk_reciever src/dpdk_reciever.cpp)
 
-    # Вторая пара существует ради одного опыта: размазать получателя по
-    # нескольким TX-очередям (dpdk_sender_mq) и починить возникающую
-    # перестановку окном (dpdk_reciever_ro). Отдельными бинарниками, чтобы
-    # основной путь остался нетронутым побайтово.
-    add_dpdk_binary(dpdk_sender_mq   src/dpdk_sender_mq.cpp)
-    add_dpdk_binary(dpdk_reciever_ro src/dpdk_reciever_ro.cpp)
+#    add_dpdk_binary(dpdk_sender_mq   src/dpdk_sender_mq.cpp)
+#    add_dpdk_binary(dpdk_reciever_ro src/dpdk_reciever_ro.cpp)
 else()
     message(STATUS "DPDK not found, skipping DPDK transport targets")
 endif()

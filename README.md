@@ -127,6 +127,7 @@ sudo RECEIVERS=4 RATE=1000000 BURST=10 PACK=8 ./scripts/tx.sh
 | [harness/RESULTS.md](harness/RESULTS.md) | все замеры целиком, с методикой и оговорками |
 | [harness/RUN.md](harness/RUN.md) | как запускать, настройка машины, многополучательский режим |
 | [harness/AWS.md](harness/AWS.md) | развёртывание стенда с нуля |
+| [harness/LOCAL.md](harness/LOCAL.md) | тестирование без AWS, в Docker — только функционально, не числа |
 | [analysis.ipynb](analysis.ipynb) | графики и разбор распределений |
 | [TASK.md](TASK.md) | исходные условия задачи от организаторов |
 

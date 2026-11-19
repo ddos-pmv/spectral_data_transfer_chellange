@@ -186,7 +186,9 @@ if clock_enabled && [ -z "$PROBE_PEERS" ]; then
 fi
 
 if [ "$DPDK_MODE" = af_packet ]; then
-  DEV=$(eal_dev) || die "интерфейса $DPDK_IFACE нет -- sudo ./scripts/veth_setup.sh up"
+  DEV=$(eal_dev) || die "интерфейса $DPDK_IFACE нет -- в af_packet это обычный
+   сетевой интерфейс контейнера/VM (например eth0 в Docker-контейнере на общей
+   docker network), а не то, что создаёт скрипт. См. LOCAL.md."
 else
   DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind"
 fi

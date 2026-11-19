@@ -13,7 +13,7 @@ SUBCOMMANDS="status bind unbind"
 
 not_pci_mode() {
   [ "$DPDK_MODE" = pci ] && return 1
-  warn "DPDK_MODE=$DPDK_MODE -- карты тут нет, это veth. См. ./scripts/veth_setup.sh"
+  warn "DPDK_MODE=$DPDK_MODE -- карты тут нет, это обычный сетевой интерфейс (например eth0 в контейнере). См. LOCAL.md"
   return 0
 }
 

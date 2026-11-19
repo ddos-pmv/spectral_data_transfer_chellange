@@ -47,9 +47,17 @@ else
 fi
 [ -x "$RECEIVER_BIN" ] || die "нет $RECEIVER_BIN -- cmake --build build -j\$(nproc)"
 if [ "$DPDK_MODE" = af_packet ]; then
-  DEV=$(eal_dev) || die "интерфейса $DPDK_IFACE нет -- sudo ./scripts/veth_setup.sh up"
+  DEV=$(eal_dev) || die "интерфейса $DPDK_IFACE нет -- в af_packet это обычный
+   сетевой интерфейс контейнера/VM (например eth0 в Docker-контейнере на общей
+   docker network), а не то, что создаёт скрипт. См. LOCAL.md."
+  # Без этого ядро не отдаёт в AF_PACKET-сокет юникаст-кадры, адресованные
+  # даже ровно в MAC интерфейса -- проверено на veth-паре между двумя
+  # контейнерами. Не ip link ... promisc on снаружи: DPDK сбросит флаг сам
+  # на старте порта. На ENA этот флаг не передаётся никогда.
+  PROMISC_ARGS=--promisc
 else
   DEV=$(eal_dev) || die "карта не привязана к $DPDK_DRIVER -- sudo ./scripts/nic.sh bind"
+  PROMISC_ARGS=
 fi
 
 # Печатаем адреса той карты, которую слушает DPDK. В pci-режиме ядру она не
@@ -106,7 +114,7 @@ taskset -c "$CPU_RECEIVER" setarch -R "./$RECEIVER_BIN" \
   $DEV \
   -- --shm /fanout_ring_rx --slots "$SLOTS" --port "$PORT" --burst "$BURST" \
      --mbufs "$RECEIVER_MBUFS" --rxd "$RECEIVER_RXD" --mtu "$MTU" \
-     $REORDER_ARGS \
+     $REORDER_ARGS $PROMISC_ARGS \
   > "$RUN/receiver.log" 2>&1 &
 RECEIVER=$!
 
